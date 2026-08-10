@@ -1,0 +1,642 @@
+"""Unit tests for the Grain analytics pipeline.
+
+Each test targets a rule that was ambiguous in the specification or a defect
+found while profiling the source data, and asserts the behaviour recorded in
+DECISIONS.md. Two of them — the inverse rate branch and ``not_found`` — cover
+code paths the supplied dataset never exercises, which is precisely why they need
+synthetic fixtures rather than trust.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from conftest import fx_rate, insert, trade
+from grain_pipeline.cleaning import apply_filters, deduplicate_trades
+from grain_pipeline.dimensions import build_dim_clients
+from grain_pipeline.facts import build_fact_daily_exposure, build_trades_enriched
+from grain_pipeline.quality import (
+    DataQualityError,
+    assert_rate_feed_unique,
+    reconcile_segment_chain,
+    run_all_checks,
+)
+from grain_pipeline.rates import build_fx_to_usd
+from grain_pipeline.run import build_analytics
+from grain_pipeline.staging import (
+    build_stg_clients,
+    build_stg_fx_rates,
+    build_stg_segment_changes,
+    build_stg_trades,
+)
+
+
+# --------------------------------------------------------------------------
+# 1. Amount unit normalisation
+# --------------------------------------------------------------------------
+
+
+def test_amount_in_thousands_is_scaled_and_survives_deduplication(con):
+    """The thousands flag scales the amount, and scaling happens before dedup.
+
+    Two versions of one trade recorded under different conventions — 5000/false
+    and 5/true — describe the same value. Normalising first means they are not
+    mistaken for a genuine amount discrepancy.
+    """
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", amount=5.0, amount_in_thousands=True, created_at="2025-10-01 09:00:00"),
+            trade("T1", amount=5000.0, amount_in_thousands=False, created_at="2025-10-02 09:00:00"),
+            trade("T2", amount=250.0, amount_in_thousands=False),
+        ],
+    )
+    build_stg_trades(con)
+
+    amounts = dict(
+        con.execute("SELECT trade_id, amount FROM stg_trades ORDER BY trade_id, amount").fetchall()
+    )
+    assert amounts["T2"] == 250.0
+
+    scaled = con.execute("SELECT DISTINCT amount FROM stg_trades WHERE trade_id = 'T1'").fetchall()
+    assert scaled == [(5000.0,)], "both versions of T1 should normalise to the same 5000.0"
+
+    deduplicate_trades(con)
+    kept = con.execute("SELECT amount FROM trades_deduplicated WHERE trade_id = 'T1'").fetchall()
+    assert kept == [(5000.0,)]
+
+
+# --------------------------------------------------------------------------
+# 2. Deterministic deduplication
+# --------------------------------------------------------------------------
+
+
+def test_deduplication_keeps_earliest_created_at(con):
+    """Version selection keeps the earliest ``created_at``, not the first row read."""
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", amount=900.0, created_at="2025-12-01 12:00:00"),
+            trade("T1", amount=100.0, created_at="2025-09-01 08:30:00"),  # earliest
+            trade("T1", amount=500.0, created_at="2025-11-15 17:45:00"),
+        ],
+    )
+    build_stg_trades(con)
+    deduplicate_trades(con)
+
+    rows = con.execute("SELECT trade_id, amount FROM trades_deduplicated").fetchall()
+    assert rows == [("T1", 100.0)]
+
+
+def test_deduplication_is_deterministic_across_insertion_orders(con, tmp_path):
+    """The same rows in a different physical order produce the same survivor.
+
+    Idempotency depends on a total ordering. ``created_at`` alone is not unique,
+    so the tiebreak is content-based rather than positional — physical row order
+    is not a guarantee the database owes us across runs.
+    """
+    import duckdb
+
+    from conftest import _RAW_TABLES, SOURCE_SCHEMA  # noqa: PLC0415
+
+    tied = [
+        trade("T1", amount=300.0, agreed_rate=1.10, created_at="2025-10-01 09:00:00"),
+        trade("T1", amount=200.0, agreed_rate=1.20, created_at="2025-10-01 09:00:00"),
+    ]
+
+    survivors = []
+    for ordering in (tied, list(reversed(tied))):
+        connection = duckdb.connect(":memory:")
+        connection.execute(f"CREATE SCHEMA {SOURCE_SCHEMA}")
+        for table, columns in _RAW_TABLES.items():
+            connection.execute(f"CREATE TABLE {SOURCE_SCHEMA}.{table} ({columns})")
+        insert(connection, "raw_trades", ordering)
+        build_stg_trades(connection)
+        deduplicate_trades(connection)
+        survivors.append(
+            connection.execute("SELECT amount FROM trades_deduplicated").fetchall()
+        )
+        connection.close()
+
+    assert survivors[0] == survivors[1]
+
+
+# --------------------------------------------------------------------------
+# 3. Normalisation ordering and exclusions
+# --------------------------------------------------------------------------
+
+
+def test_lowercase_currency_is_normalised_not_excluded(con):
+    """Currency normalisation runs before the missing-currency exclusion.
+
+    Excluding first would discard 'usd' and ' Eur ' as malformed, which is the
+    trap the requirement's ordering hides.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", base_currency="gbp", quote_currency="usd"),
+            trade("T2", base_currency=" Eur ", quote_currency="USD"),
+            trade("T3", base_currency=None, quote_currency="USD"),  # genuinely missing
+        ],
+    )
+    build_stg_clients(con)
+    build_stg_trades(con)
+    deduplicate_trades(con)
+    exclusions = apply_filters(con)
+
+    kept = con.execute(
+        "SELECT trade_id, base_currency, quote_currency FROM trades_clean ORDER BY trade_id"
+    ).fetchall()
+    assert kept == [("T1", "GBP", "USD"), ("T2", "EUR", "USD")]
+    assert exclusions["missing_or_invalid_currency"] == 1
+
+
+def test_non_iso_currency_alias_is_resolved_to_its_iso_code(con):
+    """'NIS' is rewritten to 'ILS' and converts against the ILS feed.
+
+    This is the failure that case folding cannot catch. 'NIS' is already three
+    uppercase letters, so it satisfies the ISO 4217 shape test and survives every
+    exclusion — and then matches nothing in the rate feed, which publishes the
+    same currency as 'ILS'. The trade reaches the fact table looking healthy,
+    with a NULL USD exposure.
+
+    The contrast row matters as much as the subject: 'SGD' has no feed coverage
+    at all, so it must stay ``not_found``. Resolving a documented alias is a
+    different act from inventing a rate for a currency nobody quoted.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", base_currency="NIS", amount=1000.0, agreed_rate=0.27),
+            trade("T2", base_currency="SGD", amount=2000.0, agreed_rate=0.74),
+        ],
+    )
+    insert(con, "raw_fx_rates", [fx_rate(1, "ILS", "USD", 0.275)])
+
+    build_stg_clients(con)
+    build_stg_segment_changes(con)
+    build_stg_trades(con)
+    build_stg_fx_rates(con)
+    deduplicate_trades(con)
+    exclusions = apply_filters(con)
+    build_dim_clients(con)
+    build_fx_to_usd(con)
+    build_trades_enriched(con)
+    build_fact_daily_exposure(con)
+
+    assert exclusions["missing_or_invalid_currency"] == 0, "NIS is ISO-shaped; it is never excluded"
+
+    rows = dict(
+        con.execute(
+            """
+            SELECT base_currency, (fx_rate_used, total_amount_usd, fx_rate_source)
+            FROM fact_daily_exposure
+            """
+        ).fetchall()
+    )
+
+    assert "NIS" not in rows, "the alias must not survive into the fact table"
+    assert rows["ILS"] == (0.275, 275.0, "direct")
+    assert rows["SGD"] == (None, None, "not_found"), "no feed coverage — genuinely unresolvable"
+
+    run_all_checks(con)
+
+
+def test_client_identifier_variants_collapse_without_fanout(con):
+    """Case and whitespace variants of one client_id resolve to a single client.
+
+    This is the defect found in ``raw_clients`` ('c007'/'C007', 'C003'/'C003 ').
+    Left uncorrected it fans out the dimension join and silently duplicates every
+    affected fact row — no error raised, just wrong numbers.
+    """
+    insert(
+        con,
+        "raw_clients",
+        [
+            ("C007", "Globex", "Enterprise"),
+            ("c007", "Globex", "Enterprise"),
+            ("C003 ", "Initech", "SME"),
+            ("C003", "Initech", "SME"),
+        ],
+    )
+    insert(con, "raw_trades", [trade("T1", client_id="c007"), trade("T2", client_id="C003")])
+    insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])
+
+    build_stg_clients(con)
+    build_stg_segment_changes(con)
+    build_stg_trades(con)
+    build_stg_fx_rates(con)
+    deduplicate_trades(con)
+    apply_filters(con)
+    build_dim_clients(con)
+    build_fx_to_usd(con)
+    build_trades_enriched(con)
+    build_fact_daily_exposure(con)
+
+    assert con.execute("SELECT count(*) FROM stg_clients").fetchone()[0] == 2
+    assert con.execute("SELECT count(*) FROM fact_daily_exposure").fetchone()[0] == 2
+    assert con.execute("SELECT sum(trade_count) FROM fact_daily_exposure").fetchone()[0] == 2
+
+    run_all_checks(con)  # would raise on any fan-out
+
+
+# --------------------------------------------------------------------------
+# 4. Point-in-time segment lookup
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("trade_date", "expected_segment"),
+    [
+        ("2025-01-01", "SME"),  # before the change
+        ("2025-05-31", "SME"),  # day before the change
+        ("2025-06-01", "Enterprise"),  # on the change date — half-open boundary
+        ("2026-01-15", "Enterprise"),  # after the change
+    ],
+)
+def test_segment_reflects_classification_on_the_trade_date(con, trade_date, expected_segment):
+    """The fact carries the segment held on the trade date, not the current one.
+
+    The change-date case is the one that matters: under a closed-closed interval
+    convention it would match two dimension rows and duplicate the fact row.
+    """
+    # raw_clients holds the ORIGINAL segment, so it matches from_segment.
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(con, "raw_client_segment_changes", [("C001", "SME", "Enterprise", "2025-06-01")])
+    insert(con, "raw_trades", [trade("T1", trade_date=trade_date)])
+    insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27, rate_date=trade_date)])
+
+    build_stg_clients(con)
+    build_stg_segment_changes(con)
+    build_stg_trades(con)
+    build_stg_fx_rates(con)
+    deduplicate_trades(con)
+    apply_filters(con)
+    build_dim_clients(con)
+    build_fx_to_usd(con)
+    build_trades_enriched(con)
+    build_fact_daily_exposure(con)
+
+    rows = con.execute("SELECT segment, trade_count FROM fact_daily_exposure").fetchall()
+    assert rows == [(expected_segment, 1)], "exactly one row, carrying the point-in-time segment"
+
+    run_all_checks(con)
+
+
+def test_dimension_handles_multiple_changes_per_client(con):
+    """Interval closing generalises beyond the single change the data contains.
+
+    The supplied dataset holds at most one change per client. The schema permits
+    more, so the logic is written with ``lead()`` and tested accordingly rather
+    than fitted to the sample.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_client_segment_changes",
+        [
+            ("C001", "SME", "Enterprise", "2024-01-01"),
+            ("C001", "Enterprise", "Strategic", "2025-06-01"),
+        ],
+    )
+    build_stg_clients(con)
+    build_stg_segment_changes(con)
+    build_dim_clients(con)
+
+    rows = con.execute(
+        """
+        SELECT segment, effective_start_date, effective_end_date, is_current
+        FROM dim_clients ORDER BY effective_start_date
+        """
+    ).fetchall()
+
+    assert [r[0] for r in rows] == ["SME", "Enterprise", "Strategic"]
+    assert rows[0][2] == rows[1][1], "intervals must abut with no gap"
+    assert rows[1][2] == rows[2][1]
+    assert [r[3] for r in rows] == [False, False, True]
+
+
+# --------------------------------------------------------------------------
+# 5. FX rate resolution
+# --------------------------------------------------------------------------
+
+
+def test_direct_rate_is_preferred_over_inverse(con):
+    """Where both a direct and an invertible rate exist, direct wins."""
+    insert(
+        con,
+        "raw_fx_rates",
+        [
+            fx_rate(1, "GBP", "USD", 1.27),  # direct GBP -> USD
+            fx_rate(2, "USD", "GBP", 0.50),  # invertible, deliberately inconsistent
+        ],
+    )
+    build_stg_fx_rates(con)
+    build_fx_to_usd(con)
+
+    rate, source = con.execute(
+        "SELECT rate_to_usd, rate_source FROM fx_to_usd WHERE currency = 'GBP'"
+    ).fetchone()
+    assert rate == pytest.approx(1.27)
+    assert source == "direct"
+
+
+def test_inverse_rate_is_the_reciprocal_of_the_usd_base_row(con):
+    """With no direct rate, X -> USD is derived as 1 / (USD -> X).
+
+    Unreachable on the supplied data — the only USD-base row is USD -> CAD, and
+    CAD never appears as a trade base currency — so this fixture is the only
+    thing standing between the branch and being untested.
+    """
+    insert(con, "raw_fx_rates", [fx_rate(1, "USD", "CAD", 1.25)])
+    build_stg_fx_rates(con)
+    build_fx_to_usd(con)
+
+    rate, source = con.execute(
+        "SELECT rate_to_usd, rate_source FROM fx_to_usd WHERE currency = 'CAD'"
+    ).fetchone()
+    assert rate == pytest.approx(0.8)
+    assert source == "inverse"
+
+
+def test_usd_trades_convert_at_parity_and_missing_rates_are_flagged(con):
+    """USD converts to itself at 1.0; an uncovered currency-date is ``not_found``.
+
+    No USD -> USD row exists in the feed, so a literal reading of the resolution
+    chain would flag every USD trade as ``not_found`` with a NULL converted
+    amount — plainly wrong for an identity conversion.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", base_currency="USD", quote_currency="EUR", amount=1000.0),
+            trade("T2", base_currency="JPY", quote_currency="USD", amount=2000.0),
+        ],
+    )
+    insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])  # no JPY, no USD
+
+    build_stg_clients(con)
+    build_stg_segment_changes(con)
+    build_stg_trades(con)
+    build_stg_fx_rates(con)
+    deduplicate_trades(con)
+    apply_filters(con)
+    build_dim_clients(con)
+    build_fx_to_usd(con)
+    build_trades_enriched(con)
+    build_fact_daily_exposure(con)
+
+    rows = dict(
+        con.execute(
+            """
+            SELECT base_currency, (fx_rate_used, total_amount_usd, fx_rate_source)
+            FROM fact_daily_exposure
+            """
+        ).fetchall()
+    )
+
+    assert rows["USD"] == (1.0, 1000.0, "direct")
+    assert rows["JPY"] == (None, None, "not_found"), "NULL, not zero — zero would understate sums"
+
+    run_all_checks(con)
+
+
+def test_invalid_rates_are_filtered_before_deduplication(con):
+    """A key whose only rows are NULL and zero disappears entirely.
+
+    This is the duplicate ``(base, quote, date)`` pair found in the feed. Filter
+    first and the key falls through correctly; deduplicate first and an arbitrary
+    pick could retain the invalid row.
+    """
+    insert(
+        con,
+        "raw_fx_rates",
+        [
+            fx_rate(1, "EUR", "USD", None),
+            fx_rate(2, "EUR", "USD", 0.0),
+            fx_rate(3, "GBP", "USD", 1.27),
+            fx_rate(4, "CHF", "USD", 1.10, rate_date=None),
+        ],
+    )
+    build_stg_fx_rates(con)
+    build_fx_to_usd(con)
+
+    assert_rate_feed_unique(con)  # no surviving duplicate key
+    currencies = [r[0] for r in con.execute("SELECT currency FROM fx_to_usd").fetchall()]
+    assert currencies == ["GBP"]
+
+
+def test_valid_rate_survives_a_duplicate_key_whose_twin_is_invalid(con):
+    """Where a duplicate key pairs a good rate with a bad one, the good one wins.
+
+    This is the shape the real feed actually has: ILS/USD on 2026-02-15 carries
+    both 0.275537 and 0.0, and EUR/USD on 2026-02-20 both 1.085145 and NULL. It
+    is the case that makes filter-before-deduplicate load-bearing rather than
+    merely tidy — deduplicating first with an arbitrary pick could retain the
+    zero and convert real trades at a rate of nothing, producing a plausible
+    zero-exposure row instead of an error.
+    """
+    insert(
+        con,
+        "raw_fx_rates",
+        [
+            fx_rate(1, "ILS", "USD", 0.275537),
+            fx_rate(2, "ILS", "USD", 0.0),
+            fx_rate(3, "EUR", "USD", None),
+            fx_rate(4, "EUR", "USD", 1.085145),
+        ],
+    )
+    build_stg_fx_rates(con)
+    assert_rate_feed_unique(con)
+    build_fx_to_usd(con)
+
+    resolved = dict(con.execute("SELECT currency, rate_to_usd FROM fx_to_usd").fetchall())
+    assert resolved == {"ILS": 0.275537, "EUR": 1.085145}
+
+
+# --------------------------------------------------------------------------
+# 6. Aggregation
+# --------------------------------------------------------------------------
+
+
+def test_weighted_average_is_amount_weighted_not_arithmetic(con):
+    """The agreed rate is weighted by amount, so a large trade dominates."""
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", amount=1000.0, agreed_rate=1.00),
+            trade("T2", amount=9000.0, agreed_rate=2.00),
+        ],
+    )
+    insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])
+
+    build_stg_clients(con)
+    build_stg_segment_changes(con)
+    build_stg_trades(con)
+    build_stg_fx_rates(con)
+    deduplicate_trades(con)
+    apply_filters(con)
+    build_dim_clients(con)
+    build_fx_to_usd(con)
+    build_trades_enriched(con)
+    build_fact_daily_exposure(con)
+
+    trades, base, weighted, usd = con.execute(
+        """
+        SELECT trade_count, total_amount_base, weighted_avg_agreed_rate, total_amount_usd
+        FROM fact_daily_exposure
+        """
+    ).fetchone()
+
+    assert trades == 2
+    assert base == pytest.approx(10_000.0)
+    # (1000*1.00 + 9000*2.00) / 10000 = 1.9, not the arithmetic mean of 1.5
+    assert weighted == pytest.approx(1.9)
+    assert usd == pytest.approx(12_700.0)
+
+
+def test_status_and_cutoff_exclusions_are_counted_separately(con):
+    """Every filter step reports the rows it removed, in a fixed order.
+
+    A row failing several rules is attributed to the first it fails, so the counts
+    are sequential rather than independent.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1"),
+            trade("T2", status="CANCELLED"),
+            trade("T3", status="PENDING"),
+            trade("T4", trade_date="2026-06-02"),
+            trade("T5", client_id=None),
+            trade("T6", amount=-100.0),
+            trade("T7", amount=0.0),
+        ],
+    )
+    build_stg_clients(con)
+    build_stg_trades(con)
+    deduplicate_trades(con)
+    exclusions = apply_filters(con)
+
+    assert exclusions["non_active_status"] == 2
+    assert exclusions["after_cutoff_date"] == 1
+    assert exclusions["missing_client"] == 1
+    assert exclusions["non_positive_amount"] == 2
+    assert con.execute("SELECT count(*) FROM trades_clean").fetchone()[0] == 1
+
+
+# --------------------------------------------------------------------------
+# 7. Idempotency and quality gates
+# --------------------------------------------------------------------------
+
+
+def test_pipeline_is_idempotent(con):
+    """Running the full build twice produces identical output."""
+    insert(con, "raw_clients", [("C001", "Acme", "SME"), ("c001", "Acme", "SME")])
+    insert(con, "raw_client_segment_changes", [("C001", "SME", "Enterprise", "2025-06-01")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", trade_date="2025-01-10", created_at="2024-11-01 10:00:00"),
+            trade("T1", trade_date="2025-01-10", amount=999.0, created_at="2024-12-01 10:00:00"),
+            trade("T2", trade_date="2026-01-15", base_currency="eur"),
+        ],
+    )
+    insert(
+        con,
+        "raw_fx_rates",
+        [
+            fx_rate(1, "GBP", "USD", 1.27, rate_date="2025-01-10"),
+            fx_rate(2, "EUR", "USD", 1.09, rate_date="2026-01-15"),
+        ],
+    )
+
+    build_analytics(con)
+    first_fact = con.execute("SELECT * FROM fact_daily_exposure ORDER BY ALL").fetchall()
+    first_dim = con.execute("SELECT * FROM dim_clients ORDER BY ALL").fetchall()
+
+    build_analytics(con)
+    second_fact = con.execute("SELECT * FROM fact_daily_exposure ORDER BY ALL").fetchall()
+    second_dim = con.execute("SELECT * FROM dim_clients ORDER BY ALL").fetchall()
+
+    assert first_fact == second_fact
+    assert first_dim == second_dim
+
+
+def test_quality_check_detects_a_duplicate_rate_key(con):
+    """The rate uniqueness assertion fires rather than silently picking a row.
+
+    Two *valid* rates for one key would fan out the fact table. No source
+    precedence rule is defined because none should be needed post-filter — if
+    that stops being true, this raises rather than guessing.
+    """
+    insert(
+        con,
+        "raw_fx_rates",
+        [
+            fx_rate(1, "GBP", "USD", 1.27, source="feed_a"),
+            fx_rate(2, "GBP", "USD", 1.29, source="feed_b"),
+        ],
+    )
+    build_stg_fx_rates(con)
+
+    with pytest.raises(DataQualityError, match="more than one"):
+        assert_rate_feed_unique(con)
+
+
+def test_original_state_reference_table_does_not_leak_into_the_dimension(con):
+    """The dimension is correct even when raw_clients holds the original segment.
+
+    ``raw_clients.segment`` matches ``from_segment``, so the reference table is an
+    original-state snapshot. Joining it straight onto trades would stamp every
+    trade with the client's *original* segment regardless of date — the mirror
+    image of the naive current-segment bug, and equally wrong.
+
+    Building from the change log alone avoids that. This test pins the behaviour
+    by giving raw_clients a segment that is deliberately stale.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])  # original, now stale
+    insert(con, "raw_client_segment_changes", [("C001", "SME", "Enterprise", "2025-06-01")])
+    build_stg_clients(con)
+    build_stg_segment_changes(con)
+    build_dim_clients(con)
+
+    rows = con.execute(
+        "SELECT segment, is_current FROM dim_clients ORDER BY effective_start_date"
+    ).fetchall()
+    assert rows == [("SME", False), ("Enterprise", True)]
+    assert reconcile_segment_chain(con) == 0
+
+
+def test_segment_chain_inconsistency_is_reported_not_fatal(con):
+    """A reference table that disagrees with the change log warns rather than fails.
+
+    The dimension never reads raw_clients.segment for a reclassified client, so
+    the mismatch cannot corrupt the output. Failing the load would block a correct
+    result over an upstream defect the pipeline has already routed around.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "Strategic")])  # agrees with neither
+    insert(con, "raw_client_segment_changes", [("C001", "SME", "Enterprise", "2025-06-01")])
+    build_stg_clients(con)
+    build_stg_segment_changes(con)
+    build_dim_clients(con)
+
+    assert reconcile_segment_chain(con) == 1  # reported
+    rows = con.execute(
+        "SELECT segment FROM dim_clients ORDER BY effective_start_date"
+    ).fetchall()
+    assert rows == [("SME",), ("Enterprise",)]  # dimension still correct
