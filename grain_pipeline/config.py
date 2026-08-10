@@ -30,7 +30,7 @@ USD = "USD"
 
 # Sentinel bounds for open-ended SCD2 intervals. Sentinels rather than NULLs so
 # the point-in-time join stays a plain range predicate with no three-valued
-# logic (DECISIONS.md, section 3.4).
+# logic (DECISIONS.md, section 3.5).
 DATE_FLOOR = date(1900, 1, 1)
 DATE_CEILING = date(9999, 12, 31)
 

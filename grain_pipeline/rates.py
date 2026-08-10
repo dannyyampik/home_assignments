@@ -20,7 +20,7 @@ Direct always wins where both exist, per the requirement.
 USD-denominated trades are a special case: no USD -> USD row exists in the feed,
 so a literal reading of the chain would send every USD trade to ``not_found``
 with a NULL converted amount. They are assigned a rate of 1.0 labelled
-``direct`` (DECISIONS.md, section 8.3).
+``direct`` (DECISIONS.md, section 8.4).
 
 On this dataset the only feed row with USD as base is USD -> CAD, and CAD never
 appears as a trade base currency, so the ``inverse`` branch is unreachable in

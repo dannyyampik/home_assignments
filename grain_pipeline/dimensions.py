@@ -16,7 +16,7 @@ clients that were never reclassified and for whom the two agree by definition.
 
 Intervals are half-open — ``effective_start_date <= trade_date <
 effective_end_date`` — the only convention under which a trade falling exactly on
-a change date cannot match two dimension rows (DECISIONS.md, section 3.3).
+a change date cannot match two dimension rows (DECISIONS.md, section 3.4).
 
 The current dataset holds at most one change per client, but the closing logic is
 written generically with ``lead()`` so that a client reclassified twice produces a
