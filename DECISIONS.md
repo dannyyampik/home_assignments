@@ -56,8 +56,12 @@ written. These drive the decisions in the following sections.
   generally differ in `amount`.
 - `created_at` is never NULL and is never tied within a duplicated `trade_id`,
   so it provides a usable ordering column for version selection.
-- `created_at` normally precedes `trade_date` by several months; in five cases
-  it falls a few days after.
+- `created_at` normally precedes `trade_date` by several months. Five rows have a
+  `created_at` greater than `trade_date`; of those, four fall on a genuinely
+  later calendar day and one is the same day at a later hour (`trade_date` is a
+  `DATE`, so the comparison promotes it to midnight). Neither case affects
+  version selection, since `created_at` is used only to order versions within a
+  `trade_id`.
 - Duplicate `trade_id` rows always share the same `status` — verified directly,
   and the basis for section 4.
 - `status` values: `ACTIVE` (557), `CANCELLED` (79), `PENDING` (56).
@@ -243,10 +247,10 @@ tiebreaker never fires. It costs nothing and removes a class of run-to-run
 difference that would otherwise be invisible until it happened.
 
 **On `created_at` anomalies.** Five rows have a `created_at` later than their
-`trade_date`. These are recorded as a data-quality observation and are not
-treated specially: `created_at` is used purely as a version-ordering signal
-within a `trade_id`, not as a business date, so the anomaly does not affect
-version selection.
+`trade_date` — four on a genuinely later day, one the same day at a later hour.
+These are recorded as a data-quality observation and are not treated specially:
+`created_at` is used purely as a version-ordering signal within a `trade_id`, not
+as a business date, so the anomaly does not affect version selection.
 
 ---
 
@@ -297,18 +301,38 @@ an untrimmed `ACTIVE ` would be excluded silently.
 **Observation.** Ten trades carry `base_currency = 'NIS'`. `NIS` is the
 colloquial code for the New Israeli Sheqel; its ISO 4217 code is `ILS`, and the
 rate feed publishes that currency only under `ILS`. All ten are `ACTIVE`, and
-each one's `agreed_rate` sits within roughly 2% of the `ILS` feed rate on the
-same trade date:
+form a contiguous identifier block, `T00621`–`T00630`.
 
-| `trade_date` | `NIS` `agreed_rate` | `ILS` feed `mid_rate` |
-|---|---|---|
-| 2026-01-04 | 0.274582 | 0.274793 |
-| 2026-01-28 | 0.267741 | 0.273794 |
-| 2026-03-21 | 0.292055 | 0.275090 |
-| 2026-05-14 | 0.288114 | 0.274990 |
+The evidence that these are Israeli shekel trades is **comparative**, not
+absolute. Individually the ten `agreed_rate` values deviate from the `ILS` feed
+rate on the same date by between 0.08% and 7.09%, which on its own proves
+little — trades are agreed at a spread to mid, and a 7% deviation is not
+self-evidently a match.
 
-They are also a contiguous identifier block, `T00621`–`T00630`. These are Israeli
-shekel trades recorded under a non-ISO code, not a separate currency.
+What identifies them is that **no other currency behaves this way.** Taking the
+ratio of `agreed_rate` to the market mid-rate on the same trade date, per
+currency:
+
+| Trade currency | n | mean ratio | std dev |
+|---|---|---|---|
+| **NIS** (vs `ILS` feed) | 10 | **1.011** | **0.053** |
+| GBP | 93 | 0.606 | 0.331 |
+| CHF | 89 | 0.691 | 0.399 |
+| EUR | 89 | 0.756 | 0.416 |
+| AUD | 72 | 1.129 | 0.742 |
+| ILS | 91 | 2.776 | 1.563 |
+| JPY | 67 | 120.191 | 76.006 |
+
+Every currency in this dataset carries an `agreed_rate` that is essentially
+uncorrelated with the market rate — the values are synthetic noise. The ten `NIS`
+rows are the sole exception, centring on the `ILS` mid-rate at a ratio of 1.011
+with an order of magnitude less dispersion than any other currency. They were
+generated from real `ILS` rates while everything else was randomised.
+
+A consequence worth stating: because `agreed_rate` is uncorrelated with the
+market across the rest of the dataset, `weighted_avg_agreed_rate` is computed
+correctly but is not economically meaningful on this data. The arithmetic is
+right; the inputs are synthetic.
 
 **Decision.** An explicit alias map in `config.py` rewrites `NIS` to `ILS` during
 currency canonicalisation, applied to both `raw_trades` and `raw_fx_rates` so the
