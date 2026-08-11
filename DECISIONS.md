@@ -229,6 +229,10 @@ first would drop it.
 
 This was checked directly — all 15 duplicated `trade_id` values share the same
 status in this dataset, so the two orderings produce identical results here. The
+divergent case is covered by a synthetic fixture
+(`test_deduplication_keeps_the_earliest_version_even_when_statuses_disagree`),
+so the choice is pinned by a test rather than resting on data that never
+exercises it. The
 deduplicate-first ordering is chosen anyway, because "keep the earliest version"
 reads as a property of the raw record set rather than of the filtered subset, and
 because a later `ACTIVE` row following a `CANCELLED` one is more plausibly a bad
@@ -583,6 +587,13 @@ toward zero in proportion to the missing row's size. The failure would be a
 plausible-looking number rather than an error, which is the kind worth spending a
 `FILTER` clause on.
 
+Two fixtures pin this, since the supplied data cannot:
+`test_null_agreed_rate_leaves_the_average_but_stays_in_the_totals` asserts the
+weighted average of a rated 1,000 and an unrated 3,000 is the rated trade's own
+rate rather than the 0.30 the plain form would produce, and
+`test_all_null_agreed_rates_yield_null_not_a_division_error` covers the
+all-NULL group.
+
 A row with a NULL `agreed_rate` therefore leaves both the numerator and the
 denominator, but is **retained** in `trade_count` and `total_amount_base` — the
 trade is real and its amount is known even where its rate is not. Where every row
@@ -611,7 +622,9 @@ idempotency rather than storage layout.
 Idempotency itself rests on four properties:
 
 - **Full replace, never append.** Target tables are written with
-  `CREATE OR REPLACE TABLE`, so a rerun cannot accumulate rows.
+  `CREATE OR REPLACE TABLE`, so a rerun cannot accumulate rows — and the whole
+  build runs in one transaction, so a rerun that fails partway leaves the
+  previous contents rather than a half-written mixture (section 11.1).
 - **Deterministic deduplication.** Version selection is ordered by `created_at`
   and then by the row's own business columns, leaving no arbitrary choice and no
   dependence on physical position.
@@ -629,8 +642,10 @@ a clean checkout.
 ## 11. Data quality assertions
 
 Beyond the required exclusion logging, the pipeline runs five assertions that
-**raise and abort the load**, and one reconciliation that **warns without
-failing**. All six pass on the supplied data.
+**raise and roll back the load**, and one reconciliation that **warns without
+failing**. All six pass on the supplied data. Each of the five has a test that
+constructs the corruption it exists to catch and asserts that it raises — a check
+never observed to fail is not known to work.
 
 Raising:
 
@@ -664,6 +679,44 @@ A partially-correct analytical table is worse than an absent one, because it wil
 be trusted. Where a check can distinguish "this output is wrong" from "this
 upstream input is untidy", it raises; where it cannot corrupt the output, it
 warns and names the count.
+
+### 11.1 Checks must protect the target, not merely report on it
+
+**Observation.** `CREATE OR REPLACE TABLE` is auto-committed in DuckDB, and the
+checks run last. Left that way, the checks detect corruption and *report* it,
+but do not *prevent* it: by the time an assertion fires, the target has already
+been overwritten with the data it is about to reject.
+
+This was verified rather than assumed. Injecting a second, bogus `EUR/USD` rate
+of `0.5` for 2026-01-05 makes the rate uniqueness assertion fire and the process
+exit `1` — and leaves a fully written target of 513 rows in which that date's EUR
+exposure was converted at `0.5` rather than the genuine `1.085415`, understating
+it by roughly half. The rate was chosen by the `ORDER BY` in the resolution
+window, which is a deterministic tiebreak, not a precedence rule anybody
+designed. A downstream consumer reading the target sees no error at all.
+
+**Decision.** The entire build, including `run_all_checks`, executes inside one
+explicit transaction. DDL in DuckDB is transactional, so a failing assertion
+rolls the whole build back and the last successful load remains in place. The
+rollback is logged explicitly so the operator knows the target is stale rather
+than wrong.
+
+**Rationale.** A check that cannot stop a bad load is a monitoring feature, not a
+control. The distinction matters most in exactly the case these assertions exist
+for — a silent corruption nobody is watching for — because the failure mode
+without a transaction is that the last known-good table is destroyed by the run
+that detected the problem. Exit code `1` is the right signal, but it only helps a
+caller that reads it; the data itself should be safe regardless.
+
+The cost is negligible at this volume, and measured: runs complete in 0.15–0.37s
+with the transaction, unchanged from before it. A production system at scale
+would want the same guarantee expressed as a blue/green swap or a staged
+publish rather than one long transaction, but the property being bought is
+identical.
+
+**Test.** `test_a_failed_check_leaves_the_previous_target_intact` builds a good
+target, corrupts the feed, asserts the second run raises, and asserts the target
+still holds the first run's rows byte-for-byte.
 
 ---
 

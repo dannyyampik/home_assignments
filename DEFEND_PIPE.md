@@ -28,7 +28,7 @@ If asked "walk me through what you built":
 >
 > 692 raw trades reduce to 527 after deduplication and five counted exclusion
 > steps, producing 513 fact rows. Six data quality checks run at the end; five
-> abort the load and one warns.
+> roll the load back and one warns.
 >
 > The most interesting thing I found is a defect the brief's filters cannot
 > catch. Ten trades use `NIS` for the Israeli shekel, which is the colloquial
@@ -52,7 +52,7 @@ Then stop. Let them pick the thread.
 | Rate resolution | 376 direct, 65 inverse, **72 not_found** (all SGD) |
 | `dim_clients` | 18 interval rows, 13 clients, 5 reclassified |
 | Rate feed | 1,095 rows, 3 invalid, 1,092 retained; 156 dates over a 156-day span |
-| Tests | 22 |
+| Tests | 32 |
 | Trade currencies | ILS 95, SGD 94, GBP 93, CHF 89, EUR 89, CAD 79, AUD 72, JPY 67, NIS 10, null 4 |
 
 `quote_currency` is `USD` on all 692 rows. `USD` is never a base currency.
@@ -380,7 +380,8 @@ Mutation-tested. These all fail correctly when mutated: the half-open interval
 direct-beats-inverse preference, the NIS alias removal, the USD parity branch,
 and stripping the dedup tiebreak columns.
 
-**Then concede the gaps before they find them — see Part 11, item 3.**
+**And they were validated by mutation** — see Part 11, item 3 for the full list
+and for the gaps that were found and closed that way.
 
 ---
 
@@ -493,26 +494,34 @@ you precisely what changes at 100× and at 10,000×.
 These are real. Raising them yourself converts each from a gotcha into evidence
 that you audit your own work.
 
-**1. A failed quality check does not protect the target database.**
+**1. A failed quality check used not to protect the target database — now fixed.**
 
-This is the most serious finding and the one most worth pre-empting, because it
-goes straight at what the role is asking for. `CREATE OR REPLACE TABLE` is
-auto-committed, and `run_all_checks()` runs *last*. Reproduced: injecting a
-duplicate `EUR/USD` rate causes the uniqueness assertion to fire and the process
-to exit 1 — but the target has already been fully overwritten with 513 rows built
-on an arbitrary rate pick. With a bogus `0.5` rate injected, the persisted EUR
-conversion for that date used `0.5` instead of the genuine `1.0854`, understating
-that day's EUR exposure by about half. A downstream consumer reading the target
-sees no error at all.
+This is the strongest thing to volunteer, because it shows you audited your own
+work and found something real. Tell it as a story with a fix at the end.
 
-So the checks currently **detect and report, but do not protect.** A nightly run
-would replace the last-known-good analytics database with a subtly wrong one.
+`CREATE OR REPLACE TABLE` is auto-committed and `run_all_checks()` runs *last*,
+so the original design had the checks detecting corruption **after** the target
+had already been overwritten with the data they were about to reject. Reproduced
+by injecting a bogus `EUR/USD` rate of `0.5`: the uniqueness assertion fired and
+the process exited 1, but the persisted target had 513 rows in which that date's
+EUR exposure was converted at `0.5` rather than the genuine `1.085415` —
+understated by about half, with no error visible to any downstream consumer. A
+nightly run would have replaced the last-known-good database with a subtly wrong
+one.
 
-Say it like that, then give the fix — which is small and which you have verified:
-wrap `build_analytics()` in an explicit transaction. DuckDB has transactional
-DDL, so a `ROLLBACK` on `DataQualityError` leaves the previous target intact.
-Confirmed working: after the rollback the target still held the correct
-`1.085415` rate and all 513 rows.
+The checks detected and reported, but did not protect. That is a monitoring
+feature, not a control.
+
+**The fix:** the whole build, including the checks, now runs inside one explicit
+transaction (`run.py`). DuckDB has transactional DDL, so a `DataQualityError`
+rolls the build back and the previous load survives intact. Verified: after the
+failed run the target still held `1.085415` and all 513 rows, and the rollback is
+logged explicitly so an operator knows the data is stale rather than wrong. Cost
+measured at zero — runs still complete in 0.15–0.37s.
+`test_a_failed_check_leaves_the_previous_target_intact` pins it.
+
+If pushed on what you would do at scale: the same property expressed as a
+blue/green swap or a staged publish rather than one long transaction.
 
 **2. `is_current` does not mean "the segment held today."**
 
@@ -533,28 +542,32 @@ exactly the assumption that breaks. Fix: define it as
 introduces a wall-clock dependency — which is precisely why it was avoided, so
 say that too.
 
-**3. Four of the five raising assertions have no failure-path test.**
+**3. The quality checks used to be largely unverified — now closed.**
 
-Only `assert_rate_feed_unique` has a test that constructs bad input and asserts
-`DataQualityError`. Verified by mutation: gutting `assert_fact_grain_unique` so
-it can never raise leaves all 22 tests green. The others are exercised only on
-their happy path via `run_all_checks(con)` tacked onto unrelated tests.
+Worth volunteering as the second half of the same story. Originally only
+`assert_rate_feed_unique` had a test that constructed bad input and asserted
+`DataQualityError`; gutting `assert_fact_grain_unique` so it could never raise
+left all 22 tests green. The rest were exercised only on their happy path.
 
-Given the role explicitly asks about owning what happens when checks fail, this
-is the gap most worth closing rather than defending.
+Ten tests were added, and the suite was then **mutation-tested** to prove they
+work. All of these now go red: gutting any one of the five raising assertions,
+removing the weighted-average `FILTER` clauses, dropping the ISO regex from the
+currency filter, dropping the client-resolution subquery, changing the cutoff
+from `<=` to `<`, removing the build transaction, and reversing the dedup order.
 
-Related, all confirmed by mutation:
-- Removing the `FILTER` clauses from the weighted average — the exact clause
-  `DECISIONS.md` §9 spends a paragraph justifying — leaves all tests green. No
-  fixture has a NULL `agreed_rate`.
-- The "unresolvable non-NULL `client_id`" half of the `missing_client` rule is
-  never tested; only the NULL case is.
-- The ISO-4217 regex is never distinguished from the NULL check — no fixture
-  supplies `"US"` or `"GBPX"`.
-- The cutoff boundary is tested at 2026-06-02 but never at 2026-06-01 itself,
-  so `<=` versus `<` is untested.
-- The dedup-before-filter case that actually distinguishes the two orderings — a
-  duplicate whose versions disagree on status — has no test.
+The specific gaps that are now covered:
+- A NULL `agreed_rate` leaving both sides of the weighted average, and the
+  all-NULL group returning NULL rather than erroring.
+- An unresolvable non-NULL `client_id`, and a malformed-but-non-null currency
+  (`"US"`, `"GBPX"`) — the halves of each rule a NULL-only fixture never reached.
+- The cutoff at 2026-06-01 itself, not just the day after.
+- The dedup case that actually distinguishes the two orderings — duplicate
+  versions disagreeing on status — which the supplied data never exercises.
+
+**If asked how you knew the tests were weak:** say you mutation-tested them.
+Breaking the code deliberately and checking something goes red is the only way to
+know a test suite has teeth, and it is a better answer than a coverage
+percentage.
 
 **4. Same-day double segment changes would silently drop a segment.**
 

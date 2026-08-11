@@ -9,6 +9,7 @@ synthetic fixtures rather than trust.
 
 from __future__ import annotations
 
+import duckdb
 import pytest
 
 from conftest import fx_rate, insert, trade
@@ -17,12 +18,16 @@ from grain_pipeline.dimensions import build_dim_clients
 from grain_pipeline.facts import build_fact_daily_exposure, build_trades_enriched
 from grain_pipeline.quality import (
     DataQualityError,
+    assert_conversions_consistent,
+    assert_dimension_intervals_valid,
+    assert_fact_grain_unique,
+    assert_no_trades_lost,
     assert_rate_feed_unique,
     reconcile_segment_chain,
     run_all_checks,
 )
 from grain_pipeline.rates import build_fx_to_usd
-from grain_pipeline.run import build_analytics
+from grain_pipeline.run import build_analytics, run_pipeline
 from grain_pipeline.staging import (
     build_stg_clients,
     build_stg_fx_rates,
@@ -88,6 +93,39 @@ def test_deduplication_keeps_earliest_created_at(con):
 
     rows = con.execute("SELECT trade_id, amount FROM trades_deduplicated").fetchall()
     assert rows == [("T1", 100.0)]
+
+
+def test_deduplication_keeps_the_earliest_version_even_when_statuses_disagree(con):
+    """The case that actually distinguishes dedupe-before-filter from the reverse.
+
+    Where two versions of one trade disagree on status, the two orderings give
+    opposite answers: deduplicate first and an earliest-CANCELLED trade is
+    dropped; filter first and its later ACTIVE version survives. The supplied
+    data never exercises this — all 15 duplicate pairs share a status — so
+    without this fixture the central decision of DECISIONS.md section 4 would be
+    documented but unproven.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            # T1: earliest version is CANCELLED, later version ACTIVE -> dropped.
+            trade("T1", status="CANCELLED", created_at="2025-09-01 09:00:00"),
+            trade("T1", status="ACTIVE", created_at="2025-10-01 09:00:00"),
+            # T2: the mirror image -> kept, carrying the earliest version's amount.
+            trade("T2", status="ACTIVE", amount=500.0, created_at="2025-09-01 09:00:00"),
+            trade("T2", status="CANCELLED", amount=999.0, created_at="2025-10-01 09:00:00"),
+        ],
+    )
+    build_stg_clients(con)
+    build_stg_trades(con)
+    deduplicate_trades(con)
+    exclusions = apply_filters(con)
+
+    kept = con.execute("SELECT trade_id, status, amount FROM trades_clean ORDER BY trade_id").fetchall()
+    assert kept == [("T2", "ACTIVE", 500.0)]
+    assert exclusions["non_active_status"] == 1, "the earliest-CANCELLED trade is excluded"
 
 
 def test_deduplication_is_deterministic_across_insertion_orders(con, tmp_path):
@@ -207,6 +245,64 @@ def test_non_iso_currency_alias_is_resolved_to_its_iso_code(con):
     assert rows["SGD"] == (None, None, "not_found"), "no feed coverage — genuinely unresolvable"
 
     run_all_checks(con)
+
+
+def test_malformed_and_unresolvable_values_are_excluded(con):
+    """The two exclusion halves that a NULL-only fixture never reaches.
+
+    Both rules are documented as covering two conditions each, but a NULL-only
+    fixture exercises just one of them: a currency that is present but malformed
+    is caught by the ISO shape test rather than the NULL test, and a client_id
+    that is present but unknown is caught by the resolution test rather than the
+    NULL test. Without these rows the regex and the subquery could both be
+    deleted with every test still green.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1"),  # control: survives
+            trade("T2", client_id="C999"),  # present, but no such client
+            trade("T3", base_currency="US"),  # present, but not ISO-shaped
+            trade("T4", base_currency="GBPX"),  # present, but not ISO-shaped
+        ],
+    )
+    build_stg_clients(con)
+    build_stg_trades(con)
+    deduplicate_trades(con)
+    exclusions = apply_filters(con)
+
+    kept = [r[0] for r in con.execute("SELECT trade_id FROM trades_clean").fetchall()]
+    assert kept == ["T1"]
+    assert exclusions["missing_client"] == 1, "an unresolvable client_id is as much a gap as a NULL"
+    assert exclusions["missing_or_invalid_currency"] == 2
+
+
+def test_cutoff_date_is_inclusive_of_the_boundary(con):
+    """A trade *on* 2026-06-01 is kept; the day after is excluded.
+
+    The rule is `trade_date <= 2026-06-01`, so the boundary date itself must
+    survive. Testing only the day after would leave `<=` versus `<` unpinned.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", trade_date="2026-05-31"),
+            trade("T2", trade_date="2026-06-01"),  # the boundary itself
+            trade("T3", trade_date="2026-06-02"),
+        ],
+    )
+    build_stg_clients(con)
+    build_stg_trades(con)
+    deduplicate_trades(con)
+    exclusions = apply_filters(con)
+
+    kept = [r[0] for r in con.execute("SELECT trade_id FROM trades_clean ORDER BY trade_id").fetchall()]
+    assert kept == ["T1", "T2"]
+    assert exclusions["after_cutoff_date"] == 1
 
 
 def test_client_identifier_variants_collapse_without_fanout(con):
@@ -506,6 +602,57 @@ def test_weighted_average_is_amount_weighted_not_arithmetic(con):
     assert usd == pytest.approx(12_700.0)
 
 
+def test_null_agreed_rate_leaves_the_average_but_stays_in_the_totals(con):
+    """A NULL agreed_rate is excluded from both sides of the weighted average.
+
+    The plain form `sum(amount * agreed_rate) / sum(amount)` is wrong here: the
+    numerator skips the NULL product while the denominator still counts that
+    row's amount, dragging the average toward zero in proportion to the missing
+    row's size. The failure is a plausible number rather than an error, which is
+    why the FILTER clauses exist — and why they need a fixture, since the
+    supplied data has no NULL agreed_rate to exercise them.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_trades",
+        [
+            trade("T1", amount=1000.0, agreed_rate=1.20),
+            trade("T2", amount=3000.0, agreed_rate=None),  # rate unknown, amount known
+        ],
+    )
+    insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])
+    build_analytics(con)
+
+    row = con.execute(
+        """
+        SELECT trade_count, total_amount_base, weighted_avg_agreed_rate, total_amount_usd
+        FROM fact_daily_exposure
+        """
+    ).fetchone()
+
+    assert row[0] == 2, "the trade is real and still counts"
+    assert row[1] == 4000.0, "its amount is known and still sums"
+    assert row[2] == pytest.approx(1.20), "only the rated trade contributes to the average"
+    assert row[3] == pytest.approx(4000.0 * 1.27), "conversion uses the amount, not the agreed rate"
+
+    # The plain form would have produced 1000*1.20/4000 = 0.30 instead of 1.20.
+    assert row[2] != pytest.approx(0.30)
+
+
+def test_all_null_agreed_rates_yield_null_not_a_division_error(con):
+    """Where no trade in a group has a rate, the average is NULL, not an error."""
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(con, "raw_trades", [trade("T1", agreed_rate=None), trade("T2", agreed_rate=None)])
+    insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])
+    build_analytics(con)
+
+    row = con.execute(
+        "SELECT trade_count, weighted_avg_agreed_rate FROM fact_daily_exposure"
+    ).fetchone()
+    assert row == (2, None)
+
+
 def test_status_and_cutoff_exclusions_are_counted_separately(con):
     """Every filter step reports the rows it removed, in a fixed order.
 
@@ -596,6 +743,141 @@ def test_quality_check_detects_a_duplicate_rate_key(con):
 
     with pytest.raises(DataQualityError, match="more than one"):
         assert_rate_feed_unique(con)
+
+
+# --------------------------------------------------------------------------
+# 8. Quality gate failure paths
+#
+# A check that has never been observed to fail is not known to work. Each test
+# below constructs the exact corruption the assertion exists to catch and proves
+# it raises — the happy path alone would pass just as well against a check whose
+# body had been deleted.
+# --------------------------------------------------------------------------
+
+
+def _minimal_build(con):
+    """A small but complete build, used as the starting point for corruption."""
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(con, "raw_trades", [trade("T1"), trade("T2", base_currency="EUR")])
+    insert(
+        con,
+        "raw_fx_rates",
+        [fx_rate(1, "GBP", "USD", 1.27), fx_rate(2, "EUR", "USD", 1.09)],
+    )
+    build_analytics(con)
+
+
+def test_quality_check_detects_a_fact_grain_violation(con):
+    """A duplicated grain key raises — this is the dimension fan-out detector."""
+    _minimal_build(con)
+    con.execute(
+        """
+        INSERT INTO fact_daily_exposure
+        SELECT * FROM fact_daily_exposure WHERE base_currency = 'GBP'
+        """
+    )
+
+    with pytest.raises(DataQualityError, match="declared grain is violated"):
+        assert_fact_grain_unique(con)
+
+
+def test_quality_check_detects_overlapping_dimension_intervals(con):
+    """An overlapping interval raises: a point-in-time lookup would fan out."""
+    _minimal_build(con)
+    con.execute(
+        """
+        INSERT INTO dim_clients
+        VALUES ('C001', 'Acme', 'Enterprise', DATE '2020-01-01', DATE '9999-12-31', TRUE)
+        """
+    )
+
+    with pytest.raises(DataQualityError, match="overlap or leave a gap"):
+        assert_dimension_intervals_valid(con)
+
+
+def test_quality_check_detects_trades_lost_in_the_dimension_join(con):
+    """Fact trade counts not reconciling with the cleaned set raises.
+
+    Catches both directions at once — rows dropped by the inner dimension join
+    and rows multiplied by a fan-out — because either leaves totals wrong with
+    nothing raised.
+    """
+    _minimal_build(con)
+    con.execute("DELETE FROM fact_daily_exposure WHERE base_currency = 'GBP'")
+
+    with pytest.raises(DataQualityError, match="reconciliation failed"):
+        assert_no_trades_lost(con)
+
+
+def test_quality_check_detects_an_inconsistent_conversion(con):
+    """A `not_found` row carrying a USD amount raises."""
+    _minimal_build(con)
+    con.execute(
+        """
+        UPDATE fact_daily_exposure
+        SET fx_rate_source = 'not_found'
+        WHERE base_currency = 'GBP'
+        """
+    )
+
+    with pytest.raises(DataQualityError, match="inconsistent rate source"):
+        assert_conversions_consistent(con)
+
+
+def test_a_failed_check_leaves_the_previous_target_intact(con, tmp_path):
+    """A rejected load must not overwrite the last good target.
+
+    ``CREATE OR REPLACE TABLE`` auto-commits, and the checks run last — so
+    without an enclosing transaction a failing assertion aborts the process only
+    *after* the target has been replaced by the data it just rejected. The
+    previous, good tables would already be gone and only a non-zero exit code
+    would say so.
+    """
+    source = tmp_path / "raw.duckdb"
+    target = tmp_path / "analytics.duckdb"
+
+    src = duckdb.connect(str(source))
+    src.execute("CREATE TABLE raw_clients (client_id VARCHAR, client_name VARCHAR, segment VARCHAR)")
+    src.execute(
+        "CREATE TABLE raw_client_segment_changes "
+        "(client_id VARCHAR, from_segment VARCHAR, to_segment VARCHAR, effective_date DATE)"
+    )
+    src.execute(
+        "CREATE TABLE raw_fx_rates (rate_id INTEGER, base_currency VARCHAR, "
+        "quote_currency VARCHAR, mid_rate DOUBLE, rate_date DATE, source VARCHAR)"
+    )
+    src.execute(
+        "CREATE TABLE raw_trades (trade_id VARCHAR, client_id VARCHAR, trade_date DATE, "
+        "status VARCHAR, base_currency VARCHAR, quote_currency VARCHAR, amount DOUBLE, "
+        "amount_in_thousands BOOLEAN, agreed_rate DOUBLE, created_at TIMESTAMP)"
+    )
+    src.execute("INSERT INTO raw_clients VALUES ('C001', 'Acme', 'SME')")
+    src.execute(
+        "INSERT INTO raw_trades VALUES ('T1','C001',DATE '2026-01-15','ACTIVE','GBP','USD',"
+        "1000.0,FALSE,1.25,TIMESTAMP '2025-10-01 09:00:00')"
+    )
+    src.execute("INSERT INTO raw_fx_rates VALUES (1,'GBP','USD',1.27,DATE '2026-01-15','feed_a')")
+    src.close()
+
+    run_pipeline(source_db=source, target_db=target)
+    good = duckdb.connect(str(target), read_only=True)
+    baseline = good.execute("SELECT * FROM fact_daily_exposure ORDER BY ALL").fetchall()
+    good.close()
+    assert baseline, "the first run must produce a target to protect"
+
+    # Corrupt the feed so the rate uniqueness assertion fires on the next run.
+    src = duckdb.connect(str(source))
+    src.execute("INSERT INTO raw_fx_rates VALUES (2,'GBP','USD',9.99,DATE '2026-01-15','feed_b')")
+    src.close()
+
+    with pytest.raises(DataQualityError):
+        run_pipeline(source_db=source, target_db=target)
+
+    after = duckdb.connect(str(target), read_only=True)
+    preserved = after.execute("SELECT * FROM fact_daily_exposure ORDER BY ALL").fetchall()
+    after.close()
+
+    assert preserved == baseline, "a rejected load must roll back, not overwrite the good target"
 
 
 def test_original_state_reference_table_does_not_leak_into_the_dimension(con):

@@ -7,6 +7,16 @@ Idempotency rests on four properties, all visible here:
 * No wall-clock or random value participates in any output column — the
   2026-06-01 cutoff is a literal, not a relative date.
 * The target directory is created if absent, so a clean checkout runs.
+
+The whole build runs inside a single transaction, which is what makes the
+quality checks in ``quality.py`` protective rather than merely informative. DDL
+in DuckDB is transactional, and ``CREATE OR REPLACE TABLE`` would otherwise
+auto-commit each output table *before* ``run_all_checks`` runs — so a failing
+assertion would abort the process only after the target had already been
+overwritten with data it had just rejected. The previous, good tables would be
+gone and only a non-zero exit code would say so. Building and checking inside
+one transaction means a rejected load leaves the last known-good target intact
+(DECISIONS.md, section 11.1).
 """
 
 from __future__ import annotations
@@ -77,7 +87,20 @@ def run_pipeline(source_db: Path = SOURCE_DB, target_db: Path = TARGET_DB) -> No
     try:
         con.execute(f"ATTACH '{source_db}' AS {SOURCE_SCHEMA} (READ_ONLY)")
         try:
-            build_analytics(con, SOURCE_SCHEMA)
+            # Build and verify atomically. A quality check that fires must leave
+            # the previous target untouched, not merely report that the target
+            # it already replaced is wrong.
+            con.execute("BEGIN TRANSACTION")
+            try:
+                build_analytics(con, SOURCE_SCHEMA)
+            except Exception:
+                con.execute("ROLLBACK")
+                logger.error(
+                    "Build rolled back. The target database is unchanged and still holds "
+                    "the last successful load."
+                )
+                raise
+            con.execute("COMMIT")
         finally:
             con.execute(f"DETACH {SOURCE_SCHEMA}")
     finally:

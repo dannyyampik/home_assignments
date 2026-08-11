@@ -24,7 +24,7 @@ pip install -r requirements.txt
 mkdir -p source_data && cp /path/to/grain_raw.duckdb source_data/
 
 python pipeline.py        # builds target/grain_analytics.duckdb
-python -m pytest -q       # 22 tests
+python -m pytest -q       # 32 tests
 ```
 
 The run prints its progress to stdout and mirrors it to `logs/pipeline.log`.
@@ -132,7 +132,7 @@ grain_pipeline/
 
 tests/
     conftest.py              in-memory `src` schema fixtures and row builders
-    test_pipeline.py         22 tests
+    test_pipeline.py         32 tests
 
 target/grain_analytics.duckdb    the built output
 logs/pipeline.log                the most recent run's log
@@ -400,7 +400,15 @@ in-memory database.
 `run_pipeline(source_db, target_db)` handles the rest: it checks the source
 exists and raises a message naming the expected path if not, creates `target/` if
 absent, connects to the **target** database, attaches the **source** as `src` in
-`READ_ONLY` mode, builds, and detaches in a `finally` block.
+`READ_ONLY` mode, builds inside a transaction, and detaches in a `finally` block.
+
+**The transaction is what makes the quality checks protective rather than
+informative.** `CREATE OR REPLACE TABLE` auto-commits, and the checks run last —
+so without it, a failing assertion would abort the process only *after* the
+target had been overwritten with the data it just rejected, destroying the last
+good load. DDL in DuckDB is transactional, so a `DataQualityError` rolls the
+whole build back and the previous target survives intact. See `DECISIONS.md`
+§11.1.
 
 Connecting to the target and attaching the source (rather than the reverse) is
 what makes `CREATE OR REPLACE TABLE dim_clients` write to the target by default,
@@ -466,7 +474,7 @@ deduplicate-before-filter ordering made visible in the counts.
 
 ## Tests
 
-22 tests in `tests/test_pipeline.py`, organised into seven sections.
+32 tests in `tests/test_pipeline.py`, organised into eight sections.
 
 ### How they work
 
@@ -541,12 +549,34 @@ fx_rate(1, "ILS", "USD", 0.275)
 - `test_segment_chain_inconsistency_is_reported_not_fatal` — an inconsistent
   chain is counted and warned about, and the load still completes.
 
+**8. Quality gate failure paths** — each of the five raising assertions gets the
+corruption it exists to catch, and must raise. Testing only the happy path would
+pass equally well against a check whose body had been deleted.
+- `test_quality_check_detects_a_fact_grain_violation`
+- `test_quality_check_detects_overlapping_dimension_intervals`
+- `test_quality_check_detects_trades_lost_in_the_dimension_join`
+- `test_quality_check_detects_an_inconsistent_conversion`
+- `test_a_failed_check_leaves_the_previous_target_intact` — builds a good target,
+  corrupts the feed, and asserts the failed rerun leaves the good rows in place
+  rather than overwriting them.
+
+### Mutation-tested
+
+The suite was validated by breaking the production code and confirming something
+goes red. All of these are caught: the half-open interval (`<` → `<=`), dedup
+ordering (earliest → latest), rate inversion (`1/r` → `r`), direct-beats-inverse
+preference, removal of the NIS alias, removal of the USD parity branch, stripping
+the dedup tiebreak columns, removing the weighted-average `FILTER` clauses,
+dropping the ISO regex from the currency filter, dropping the client-resolution
+subquery, changing the cutoff from `<=` to `<`, removing the build transaction,
+and gutting any one of the five raising assertions.
+
 Running a subset:
 
 ```bash
 python -m pytest -q -k dedup          # deduplication tests
 python -m pytest -q -k "rate or fx"   # FX resolution tests
-python -m pytest -v                   # names of all 22
+python -m pytest -v                   # names of all 32
 ```
 
 ---
@@ -564,7 +594,8 @@ unordered scan would be testing something the database does not promise.
 It rests on four properties:
 
 - **Full replace, never append** — `CREATE OR REPLACE TABLE`, so a rerun cannot
-  accumulate rows.
+  accumulate rows; and the build runs in one transaction, so a rerun that fails
+  partway leaves the previous contents rather than a half-written mixture.
 - **Deterministic deduplication** — ordered by `created_at` then by the row's own
   business columns; no arbitrary choice and no dependence on physical position.
 - **Deterministic rate resolution** — the uniqueness assertion on the cleaned
