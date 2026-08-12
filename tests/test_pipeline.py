@@ -163,6 +163,38 @@ def test_deduplication_is_deterministic_across_insertion_orders(con, tmp_path):
     assert survivors[0] == survivors[1]
 
 
+def test_dedup_ordering_covers_every_distinguishing_column(con):
+    """Two versions differing *only* in a late-ordered column still resolve stably.
+
+    The tiebreak is only a total order if it covers every column that can
+    distinguish two versions. Rows tying on ``created_at``, ``amount``,
+    ``agreed_rate``, ``status`` and ``base_currency`` but differing in
+    ``trade_date`` would fall back to physical row order if the ordering stopped
+    at the first five — which is precisely the run-to-run instability the tiebreak
+    exists to remove.
+    """
+    from conftest import _RAW_TABLES, SOURCE_SCHEMA  # noqa: PLC0415
+
+    tied = [
+        trade("T1", trade_date="2026-01-15", created_at="2025-10-01 09:00:00"),
+        trade("T1", trade_date="2026-02-20", created_at="2025-10-01 09:00:00"),
+    ]
+
+    survivors = []
+    for ordering in (tied, list(reversed(tied))):
+        connection = duckdb.connect(":memory:")
+        connection.execute(f"CREATE SCHEMA {SOURCE_SCHEMA}")
+        for table, columns in _RAW_TABLES.items():
+            connection.execute(f"CREATE TABLE {SOURCE_SCHEMA}.{table} ({columns})")
+        insert(connection, "raw_trades", ordering)
+        fact_daily_exposure.stage_trades(connection)
+        fact_daily_exposure.deduplicate_trades(connection)
+        survivors.append(connection.execute("SELECT trade_date FROM trades_deduplicated").fetchall())
+        connection.close()
+
+    assert survivors[0] == survivors[1], "insertion order must not decide the survivor"
+
+
 # --------------------------------------------------------------------------
 # 3. Normalisation ordering and exclusions
 # --------------------------------------------------------------------------
@@ -783,6 +815,38 @@ def test_quality_check_detects_a_fact_grain_violation(con):
 
     with pytest.raises(DataQualityError, match="declared grain is violated"):
         fact_daily_exposure.assert_grain_unique(con)
+
+
+def test_quality_check_detects_unorderable_segment_changes(con):
+    """Two changes for one client on one date raise rather than resolve arbitrarily.
+
+    This is the case where a structurally valid dimension is semantically wrong.
+    With no sequence column the `lead()` ordering resolves the tie arbitrarily,
+    one interval collapses to zero length and is dropped, and a segment vanishes
+    from the client's history — while the interval-integrity check still passes,
+    because what remains is contiguous, non-overlapping and single-current.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(
+        con,
+        "raw_client_segment_changes",
+        [
+            ("C001", "SME", "Mid", "2026-02-01"),
+            ("C001", "Mid", "Enterprise", "2026-02-01"),  # same date, no way to order
+        ],
+    )
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+
+    with pytest.raises(DataQualityError, match="more than one segment change"):
+        dim_clients.assert_change_log_orderable(con)
+
+    # And the check it protects would NOT have caught it: build anyway and show
+    # the resulting dimension passes interval validation while having lost "Mid".
+    dim_clients.build_dimension(con)
+    dim_clients.assert_intervals_valid(con)
+    segments = [r[0] for r in con.execute("SELECT segment FROM dim_clients ORDER BY effective_start_date").fetchall()]
+    assert "Mid" not in segments, "the dropped segment is exactly what makes this silent"
 
 
 def test_quality_check_detects_overlapping_dimension_intervals(con):

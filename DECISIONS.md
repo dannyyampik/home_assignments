@@ -1,843 +1,559 @@
 # DECISIONS.md
 
-This document records the decisions taken where the assignment requirements were
-ambiguous, incomplete, or in tension with each other, together with the data
-observations that drove them.
-
-Every decision below traces back to something observed in the source data rather
-than something assumed. Where the source data did not exercise a rule, the rule
-is still implemented to specification and covered by a synthetic test fixture.
+Decisions taken where the requirements were ambiguous, incomplete, or in tension
+with each other, and the data observations that drove them.
 
 ---
 
-## 1. Profiling summary
+## 1. What the profiling found
 
-Findings from profiling `source_data/grain_raw.duckdb` before any code was
-written. These drive the decisions in the following sections.
+Established by direct query before any code was written.
 
-**`raw_clients`**
+**`raw_clients`** — 15 rows, 13 distinct clients
+- Duplicate identifiers for one logical client: `c007`/`C007` (case),
+  `C003`/`C003 ` (trailing blank, confirmed by byte length — not a zero-width or
+  homoglyph character, so `trim` suffices). Both pairs agree on name and segment.
+- `segment` matches `from_segment` in the change log, so this is an
+  **original-state** snapshot, not current state.
 
-- Contains duplicate client records under case and whitespace variants of the
-  same identifier: `c007` / `C007`, and `C003` / `C003 ` (trailing blank).
-- Duplicate pairs agree on both `client_name` and `segment`.
-- Neither duplicated client appears in `raw_client_segment_changes`.
-
-**`raw_client_segment_changes`**
-
-- Exactly one row per `client_id` in the current dataset.
-- No `valid_to` / `effective_end` column — intervals must be derived.
-- `raw_clients.segment` matches `from_segment`, establishing that `raw_clients`
-  holds each client's **original** state, not their current classification.
-- No multiple changes per client on the same `effective_date`.
-- Contains no rows for the duplicated client identifiers.
+**`raw_client_segment_changes`** — 5 rows
+- One row per client, for 5 of the 13 clients. No `valid_to` column: intervals
+  must be derived. No sequence column, and no two changes share a client and date.
 
 **`raw_fx_rates`** — 1,095 rows
-
-- Seven currency pairs, all quoted against USD except one: `AUD/USD`, `CHF/USD`,
-  `EUR/USD`, `GBP/USD`, `ILS/USD`, `JPY/USD`, and `USD/CAD`.
-- 156 distinct `rate_date` values spanning 2026-01-01 to 2026-06-05 — a 156-day
-  range, so coverage is **complete on a full calendar**, weekends and holidays
-  included, with no gaps.
-- Three invalid rows, one of each defect the requirement names:
-  `ILS/USD` on 2026-02-15 with `mid_rate = 0`, `EUR/USD` on 2026-02-20 with a
-  NULL `mid_rate`, and a `GBP/USD` row with a NULL `rate_date`.
-- The first two of those create duplicate
-  `(base_currency, quote_currency, rate_date)` keys — and in both cases the
-  duplicate pairs a **valid** rate with the invalid one, from the same `source`
-  (`reuters`). This is what makes the filter-before-deduplicate ordering
-  load-bearing; see section 8.1.
-- No `USD → USD` row exists.
-- No SGD row exists in any position, as base or quote.
+- Seven pairs, all quoted against USD except `USD/CAD`: `AUD`, `CHF`, `EUR`,
+  `GBP`, `ILS`, `JPY` → USD, plus USD → `CAD`.
+- 156 distinct dates over a 156-day span (2026-01-01 to 2026-06-05) — complete on
+  a **full calendar**, weekends included.
+- Three invalid rows, one per defect the brief names: `ILS/USD` 2026-02-15 with
+  `mid_rate = 0`, `EUR/USD` 2026-02-20 with a NULL rate, and a `GBP/USD` row with
+  a NULL date.
+- The first two create duplicate `(base, quote, date)` keys — each pairing a
+  **valid** rate with the invalid one. See §8.1.
+- No `USD → USD` row. No SGD row in any position.
 
 **`raw_trades`** — 692 rows
-
-- 15 `trade_id` values appear exactly twice; none appear three or more times.
-  677 distinct trades, so 2.2% of trades carry a superseded version. Duplicates
-  generally differ in `amount`.
-- `created_at` is never NULL and is never tied within a duplicated `trade_id`,
-  so it provides a usable ordering column for version selection.
-- `created_at` normally precedes `trade_date` by several months. Five rows have a
-  `created_at` greater than `trade_date`; of those, four fall on a genuinely
-  later calendar day and one is the same day at a later hour (`trade_date` is a
-  `DATE`, so the comparison promotes it to midnight). Neither case affects
-  version selection, since `created_at` is used only to order versions within a
-  `trade_id`.
-- Duplicate `trade_id` rows always share the same `status` — verified directly,
-  and the basis for section 4.
-- `status` values: `ACTIVE` (557), `CANCELLED` (79), `PENDING` (56).
-- `quote_currency` is `USD` on every row. `base_currency` contains 4 NULLs and
-  mixed case (8 rows spelled `eur`).
-- Trade `base_currency` values: ILS (95), SGD (94), GBP (93), CHF (89), EUR (89,
-  including the lowercase rows), **CAD (79)**, AUD (72), JPY (67), **NIS (10)**,
-  NULL (4).
-- **CAD is a trade base currency**, and the feed carries no `CAD → USD` row — so
-  the inverse branch is exercised in production, not merely implemented. See
-  section 8.3.
-- **USD is never a trade base currency.** The USD parity rule of section 8.4 is
-  therefore defensive rather than load-bearing on this data.
-- `NIS` and `SGD` have no rate under those codes. They are different problems and
-  get different treatment — see section 6.1.
-- 5 rows carry a NULL `client_id`. Every non-NULL `client_id` resolves to
-  `raw_clients` after canonicalisation.
-- `amount_in_thousands` has no NULLs: 549 rows false, 143 true.
-- `agreed_rate` has **no NULLs, no zeros and no negative values** across all 692
-  rows.
+- 15 `trade_id`s appear exactly twice (2.2%); none more. 677 distinct.
+- Duplicate rows always share a `status`, and never tie on `created_at`.
+- `created_at` is never NULL. Five rows have `created_at > trade_date` — four on a
+  later calendar day, one the same day at a later hour.
+- `status`: `ACTIVE` 557, `CANCELLED` 79, `PENDING` 56.
+- `quote_currency` is `USD` on every row. `base_currency` has 4 NULLs and 8 rows
+  spelled `eur`.
+- Base currencies: ILS 95, SGD 94, GBP 93, CHF 89, EUR 89, **CAD 79**, AUD 72,
+  JPY 67, **NIS 10**, NULL 4.
+- **CAD is a base currency** with no `CAD → USD` feed row, so the inverse branch
+  is exercised in production. **USD is never a base currency**, so the parity rule
+  of §8.4 is defensive rather than load-bearing.
+- 5 NULL `client_id`; every non-NULL one resolves after canonicalisation.
+- `amount_in_thousands` has no NULLs (549 false, 143 true).
+- `agreed_rate` has **no NULLs, no zeros, no negatives**.
 
 ---
 
-## 2. Client identity and deduplication
+## 2. Client identity
 
-**Observation.** `raw_clients` contains the same logical client under multiple
-identifier spellings. `c007` differs from `C007` by case; `C003 ` differs from
-`C003` by a trailing blank (confirmed by byte-length inspection — not a
-zero-width or homoglyph character, so trimming is a sufficient fix). The
-duplicate pairs agree on name and segment, so there is no survivorship conflict
-to resolve.
+**Observation.** The same logical client appears under several identifier
+spellings, and the pairs agree on name and segment, so there is no survivorship
+conflict.
 
-**Decision.** Client identifiers are canonicalised as `upper(trim(client_id))`
-before any join or grouping. Duplicates collapsing to the same canonical key are
-reduced to a single dimension row.
+**Decision.** Canonicalise as `upper(trim(client_id))` in all three tables that
+carry it, and collapse duplicates to one row.
 
-**Rationale.** Left uncorrected, this defect has two distinct failure modes, both
-silent:
-
-- On the **fact side**, a client's exposure splits across two rows that should be
-  one, understating per-client totals.
-- On the **dimension side**, a one-to-many join fans out the fact table and
-  duplicates every affected row, breaking the declared grain.
-
-In this dataset only the second risk is live — `raw_trades` references neither
-the lowercase `c007` nor the padded `C003 ` variant, so no fact-side split
-occurs. The normalisation is applied regardless, because the defect exists in the
-source and the pipeline should not depend on which variants the trade feed
-happens to use today.
-
-The same `upper(trim(...))` canonicalisation is applied to `client_id` in
-`raw_trades` and `raw_client_segment_changes`, so that all three tables join on a
-consistent key.
+**Why.** Uncorrected, this fails silently in two ways: on the fact side a
+client's exposure splits across rows that should be one; on the dimension side a
+one-to-many join fans out the fact and duplicates every affected row. Only the
+second is live here — no trade references `c007` or `C003 ` — but the defect is
+in the source, and the pipeline should not depend on which spellings the trade
+feed happens to use today.
 
 ---
 
-## 3. `dim_clients` — Type 2 slowly changing dimension
+## 3. `dim_clients` — Type 2 SCD
 
-**Requirement.** The table must support point-in-time lookups so that historical
-analyses reflect the segment a client was in at the time of the trade.
+One row per client per segment interval, keyed by canonical `client_id` and
+bounded by `effective_start_date` / `effective_end_date`.
 
-**Decision.** A Type 2 SCD with one row per client per segment interval, keyed by
-canonical `client_id` and bounded by `effective_start_date` and
-`effective_end_date`.
+### 3.1 Both sources are needed, for different things
 
-### 3.1 Reconstruction direction
+`raw_clients.segment` matches `from_segment`, which establishes that it holds the
+client's **original** classification. Joining it onto trades directly would stamp
+every trade with the original segment regardless of date — the mirror image of
+the naive current-segment bug the brief warns about, and harder to spot because it
+fails in the less obvious direction.
 
-`raw_clients.segment` matches `from_segment` in the change log, which establishes
-that the reference table holds each client's **original** classification, not
-their current one. History is therefore built **forward**:
+The dimension therefore uses:
 
-- A client **with** a change row yields two intervals — `from_segment` from the
-  beginning of time until `effective_date`, then `to_segment` from
-  `effective_date` onward.
-- A client **with no** change row yields a single interval spanning all time,
-  carrying `raw_clients.segment`. For these clients the distinction is moot: with
-  no reclassification, original and current segment are the same value.
+| Source | Supplies |
+|---|---|
+| `raw_clients` | the client universe, and `client_name` |
+| `raw_client_segment_changes` | the history, for the 5 clients that have one |
 
-**Why this matters beyond the implementation.** Because `raw_clients` is an
-original-state snapshot rather than a current-state one, joining
-`raw_clients.segment` directly onto trades would stamp every trade with the
-client's *original* segment irrespective of date. That is the mirror image of the
-naive current-segment bug the requirement warns against, and produces wrong
-answers just as reliably — it simply fails in the opposite direction, which makes
-it harder to spot by inspection.
+For a client **with** changes, each interval takes its segment from
+`from_segment` or `to_segment`, so the history is self-describing and does not
+depend on how `raw_clients.segment` is interpreted. History is built forward:
+`from_segment` from the floor date until the change, `to_segment` from the change
+onward.
 
-The dimension is consequently built from the change log alone, which is
-self-describing: each interval takes its segment from `from_segment` or
-`to_segment` rather than from the reference table. The build is therefore correct
-under either interpretation of what `raw_clients.segment` represents, which is
-the property worth having when the semantics of a source column are asserted
-rather than documented.
+For a client with **no** change row there is no history to reconstruct and the
+change log says nothing about them, so their single all-time interval necessarily
+takes its segment from `raw_clients`. That is unambiguous precisely because,
+never having been reclassified, their original and current segment are the same
+value.
 
-### 3.2 Reconciliation rather than assertion
+### 3.2 Reconciliation warns rather than fails
 
-The pipeline logs, but does not fail on, disagreement between
-`raw_clients.segment` and the earliest `from_segment` for a client, and on any
-discontinuity in the change chain (where one row's `from_segment` does not equal
-the previous row's `to_segment`).
+Two disagreements are logged, not raised: `raw_clients.segment` differing from a
+client's earliest `from_segment`, and a break in the chain where one row's
+`from_segment` does not equal the previous row's `to_segment`.
 
-These are reported at warning level rather than raised because they cannot
-corrupt the output: the dimension does not read `raw_clients.segment` for
-reclassified clients, so a mismatch is a statement about the *reference table*
-rather than about the dimension. Failing the load on it would block a correct
-result over an upstream inconsistency the pipeline has already routed around. The
-count is surfaced so the disagreement is visible and can be raised with the
-source system owner.
+Both apply only to the 5 clients that appear in the change log — for the other 8
+there is no `from_segment` to compare against, and `raw_clients` is the dimension's
+source rather than a cross-check on it.
 
-### 3.3 Generalising beyond the observed data
+They warn because neither can corrupt the output: for a reclassified client the
+dimension never reads `raw_clients.segment`, so a mismatch is a statement about
+the reference table. Failing the load would block a correct result over an
+upstream inconsistency the pipeline has already routed around. The count is
+surfaced so it can be raised with the source system owner.
 
-The current dataset contains at most one change per client. The interval closing
-logic is nevertheless implemented generically, using
-`lead(effective_date) over (partition by client_id order by effective_date)`, so
-that clients with two or more changes produce a correct interval chain without
-modification.
+### 3.3 Multiple changes, and the one case that is refused
 
-This costs nothing on the present data and avoids a rebuild the first time a
-client is reclassified twice — which the schema clearly permits even though the
-sample does not contain it.
+Interval closing uses `lead(effective_date) OVER (PARTITION BY client_id ORDER BY
+effective_date)`, so a client reclassified twice produces a correct chain without
+modification, even though the sample has at most one change each.
 
-### 3.4 Interval boundary convention
+That generality has a boundary, and it is **enforced rather than assumed**. Two
+changes for one client on the same date cannot be ordered — the change log has no
+sequence column. Left alone, the tie resolves arbitrarily, one interval collapses
+to zero length and is dropped, and a segment silently vanishes from the client's
+history *while the interval-integrity check still passes*, because what remains is
+contiguous, non-overlapping and single-current.
 
-Intervals are **half-open**: `effective_start_date <= trade_date <
-effective_end_date`.
+There is no correct answer to guess at, so `assert_change_log_orderable` declares
+the ordering assumption as a contract and fails the load when it is violated.
 
-This is the only convention under which a trade falling exactly on a change date
-cannot match two dimension rows. A closed-closed convention would double-join on
-that boundary and silently duplicate fact rows.
+### 3.4 Half-open intervals
+
+`effective_start_date <= trade_date < effective_end_date`. This is the only
+convention under which a trade falling exactly on a change date cannot match two
+dimension rows; closed-closed would double-join on the boundary and silently
+duplicate fact rows.
+
+Note this is deliberately *not* SQL `BETWEEN`, which is inclusive on both sides
+and would reintroduce the double match.
 
 ### 3.5 Open boundaries
 
-Rather than NULLs, open intervals use sentinel dates: `1900-01-01` for the
-earliest `effective_start_date` and `9999-12-31` for the current
-`effective_end_date`. This keeps the point-in-time join to a plain `BETWEEN`-style
-predicate with no NULL handling, which is both simpler to read and less prone to
-three-valued-logic mistakes.
+Sentinel dates rather than NULLs — `1900-01-01` and `9999-12-31` — so the
+point-in-time join stays a simple range predicate with no three-valued logic. The
+earliest interval extends to the floor sentinel, so it covers every trade date in
+the source domain and the brief's silence on trades predating known history needs
+no special handling.
 
-An `is_current` boolean flag is included as a convenience for consumers who want
-present-day segmentation without a date predicate.
-
-### 3.6 Trades predating all known history
-
-Not applicable in practice, since the earliest interval extends back to the
-sentinel floor date and therefore covers any trade date. Documented here because
-the requirement is silent on it and the behaviour should be explicit rather than
-incidental.
+An `is_current` flag is included for consumers wanting present-day segmentation
+without a date predicate. It is defined as "the last interval in the chain"; with
+a future-dated change that differs from "the interval containing today", which is
+a known limitation (§13).
 
 ---
 
 ## 4. Trade deduplication
 
-**Observation.** `trade_id` is not unique. Duplicate rows generally differ in
-`amount`. A `created_at` timestamp is available and duplicate rows always share
-the same `status`.
+**Observation.** `trade_id` is not unique; duplicates generally differ in
+`amount`, always share a `status`, and never tie on `created_at`.
 
-**Decision.** Deduplicate by `trade_id`, keeping the row with the earliest
-`created_at`, with the remaining business columns as a deterministic tiebreaker.
-Deduplication runs **before** the status and date filters.
+**Decision.** One row per `trade_id`, earliest `created_at`, deduplicated
+**before** the status and date filters.
 
-**Rationale on ordering.** The requirements state both "keep the earliest
-version" and "include only ACTIVE trades", which conflict when a `trade_id`
-appears with different statuses across versions: filtering first would retain a
-later `ACTIVE` row whose earliest version was `CANCELLED`, while deduplicating
-first would drop it.
+**Ordering.** The brief says both "keep the earliest version" and "include only
+ACTIVE trades". These conflict when versions of one `trade_id` disagree on
+status: filter first and a later `ACTIVE` row survives whose earliest version was
+`CANCELLED`; deduplicate first and it is dropped. "Keep the earliest version" is
+read as a property of the raw record set rather than of the filtered subset, so
+deduplication runs first.
 
-This was checked directly — all 15 duplicated `trade_id` values share the same
-status in this dataset, so the two orderings produce identical results here. The
-divergent case is covered by a synthetic fixture
-(`test_deduplication_keeps_the_earliest_version_even_when_statuses_disagree`),
-so the choice is pinned by a test rather than resting on data that never
-exercises it. The
-deduplicate-first ordering is chosen anyway, because "keep the earliest version"
-reads as a property of the raw record set rather than of the filtered subset, and
-because a later `ACTIVE` row following a `CANCELLED` one is more plausibly a bad
-resubmission than a genuine reinstatement.
+The two orderings are equivalent on this data, so the choice is not forced by it.
+It is a reading of the requirement, not an inference about what a
+`CANCELLED`-then-`ACTIVE` sequence means — that is a question for the business,
+and the two answers carry opposite risks: dropping a genuine reinstatement
+understates exposure, while keeping a stale resubmission overstates it. Recorded
+in §13 as an open question. A fixture pins the chosen behaviour so it cannot
+change silently.
 
-**Rationale on the tiebreaker.** Idempotency requires a stable total ordering.
-`created_at` alone is not guaranteed unique, and physical row order — `rowid` or
-an unordered scan — is not a guarantee the database owes us across runs. The
-tiebreak is therefore **content-based**: after `created_at`, the ordering falls
-through to `amount`, `agreed_rate`, `status` and `base_currency`. Ordering on the
-row's own values is stable by construction in a way that position is not, so the
-same input file cannot produce a different winner on a later run.
+**Tiebreak.** Idempotency requires a total ordering and `created_at` is not
+guaranteed unique. The ordering is content-based rather than positional —
+physical row order is not a guarantee the database owes us across runs — and
+covers **every** column that can distinguish two versions: `amount`,
+`agreed_rate`, `status`, `base_currency`, `quote_currency`, `client_id`,
+`trade_date`. Rows tying on all of them are identical, so which survives is
+immaterial. That is what makes it a total order rather than a longer tiebreak. It
+never fires on this data.
 
-In this dataset no duplicate pair actually ties on `created_at`, so the
-tiebreaker never fires. It costs nothing and removes a class of run-to-run
-difference that would otherwise be invisible until it happened.
-
-**On `created_at` anomalies.** Five rows have a `created_at` later than their
-`trade_date` — four on a genuinely later day, one the same day at a later hour.
-These are recorded as a data-quality observation and are not treated specially:
-`created_at` is used purely as a version-ordering signal within a `trade_id`, not
-as a business date, so the anomaly does not affect version selection.
+**`created_at` anomalies.** Five rows have `created_at` after `trade_date`. Not
+treated specially: `created_at` orders versions within a `trade_id`, it is not
+used as a business date.
 
 ---
 
 ## 5. Amount normalisation
 
-**Observation.** `amount_in_thousands` is a boolean column with no NULLs.
+**Decision.** Where `amount_in_thousands` is true, multiply by 1,000. This runs
+**before** deduplication and before the positive-amount filter.
 
-**Decision.** Where `amount_in_thousands` is true, the amount is multiplied by
-1,000 to produce a canonical amount in whole base-currency units. Normalisation
-happens **before** deduplication and before the positive-amount filter.
+**Why the ordering.** Normalising before deduplication means two versions
+recorded under different conventions — `5000/false` and `5/true` — are seen as
+carrying the same value rather than as a real discrepancy. Normalising before the
+filter means the zero-or-negative test applies to real values.
 
-**Rationale.** Ordering matters in both directions. Normalising before
-deduplication means two versions of the same trade recorded under different
-conventions — for example `5000 / false` and `5 / true` — are correctly seen as
-carrying the same value rather than as a genuine amount discrepancy. Normalising
-before the exclusion filter means the zero-or-negative test is applied to real
-values rather than to scaled ones.
-
-A defensive default of `false` is applied should a NULL appear in future data, so
-that an unflagged row is never silently inflated by three orders of magnitude.
+A NULL flag defaults to `false`, so an unflagged row is never silently inflated
+by three orders of magnitude. The opposite risk is real and unexamined — a large
+trade with a missing flag is understated 1000× instead — but the column has no
+NULLs, so neither default is exercised. Recorded in §13.
 
 ---
 
 ## 6. Currency normalisation
 
-**Observation.** `base_currency` and `quote_currency` in `raw_trades` contain
-mixed case; `base_currency` also contains NULLs.
+**Decision.** Canonicalise as `upper(trim(...))` and check the result matches
+`^[A-Z]{3}$`, applied identically to `raw_trades` and `raw_fx_rates`.
 
-**Decision.** Currency codes are canonicalised as `upper(trim(...))` and
-validated against the ISO 4217 three-letter pattern. Normalisation runs **before**
-the "missing currency information" exclusion.
+**Why.** Applying the exclusion before normalisation would discard valid rows
+such as `usd`. Normalising the trades table but not the rate feed would make the
+FX join miss silently — the brief mentions normalisation only under trades, but
+the join cannot be correct unless both sides are treated the same way. `status`
+gets the same treatment for the same reason.
 
-The identical normalisation is applied to `base_currency` and `quote_currency` in
-`raw_fx_rates`.
+**What the check is and is not.** `^[A-Z]{3}$` is a **format** check, not
+validation against the ISO 4217 register. It catches a NULL or a malformed value;
+it cannot catch a well-formed code that is not an ISO one. Validating properly
+would need an allowed-code reference set, which the assignment does not supply.
+That gap is exactly what §6.1 addresses.
 
-**Rationale.** Applying the exclusion before normalisation would discard valid
-rows such as `usd` or `Usd ` as malformed. Applying normalisation to the trades
-table but not the rates table would cause the FX join to miss silently — the
-requirement mentions normalisation only under the trades section, but the join
-cannot be correct unless both sides are treated the same way.
+### 6.1 `NIS` → `ILS`
 
-`status` values receive the same `upper(trim(...))` treatment. The requirement
-does not call for it, but the defect class is identical to the currency case and
-an untrimmed `ACTIVE ` would be excluded silently.
+**Observation.** Ten `ACTIVE` trades carry `base_currency = 'NIS'`. `NIS` is the
+conventional shorthand for the New Israeli Sheqel; its ISO 4217 code is `ILS`,
+and the supplied rate feed publishes that currency only as `ILS`.
 
-### 6.1 Non-ISO currency codes — `NIS` → `ILS`
+**Decision.** A source-specific alias map in `config.py` rewrites `NIS` to `ILS`
+during canonicalisation, applied to both trades and the rate feed. The number of
+rewritten values is logged. It is an explicit whitelist of one entry, configured
+deliberately — not a generic inference rule.
 
-**Observation.** Ten trades carry `base_currency = 'NIS'`. `NIS` is the
-colloquial code for the New Israeli Sheqel; its ISO 4217 code is `ILS`, and the
-rate feed publishes that currency only under `ILS`. All ten are `ACTIVE`, and
-form a contiguous identifier block, `T00621`–`T00630`.
+**Why.** `NIS` is three uppercase letters, so it passes the format check and is
+never excluded; it simply matches no rate. The trades survive every filter, are
+counted in `trade_count` and `total_amount_base`, and reach the fact table looking
+healthy with `fx_rate_source = 'not_found'` and a NULL USD exposure. Nothing
+errors and no count looks wrong. "Codes normalised to standard ISO 4217 format"
+is not satisfied by case folding alone, and a code that is not an ISO code is
+what that instruction is about.
 
-The evidence that these are Israeli shekel trades is **comparative**, not
-absolute. Individually the ten `agreed_rate` values deviate from the `ILS` feed
-rate on the same date by between 0.08% and 7.09%, which on its own proves
-little — trades are agreed at a spread to mid, and a 7% deviation is not
-self-evidently a match.
+**Corroboration.** The identification rests on the currency convention, not on
+the data. The data agrees: taking the ratio of `agreed_rate` to the market
+mid-rate on the same date, `NIS` sits at 1.011 (sd 0.053) against the `ILS` feed,
+while every other currency ranges from 0.61 to 120 with an order of magnitude
+more dispersion. Individually the ten deviate by 0.08% to 7.09%, which proves
+little alone — it is the comparison that is decisive.
 
-What identifies them is that **no other currency behaves this way.** Taking the
-ratio of `agreed_rate` to the market mid-rate on the same trade date, per
-currency:
+*(A consequence worth noting: `agreed_rate` is uncorrelated with the market
+across the rest of the dataset, so `weighted_avg_agreed_rate` is computed
+correctly on economically synthetic input.)*
 
-| Trade currency | n | mean ratio | std dev |
-|---|---|---|---|
-| **NIS** (vs `ILS` feed) | 10 | **1.011** | **0.053** |
-| GBP | 93 | 0.606 | 0.331 |
-| CHF | 89 | 0.691 | 0.399 |
-| EUR | 89 | 0.756 | 0.416 |
-| AUD | 72 | 1.129 | 0.742 |
-| ILS | 91 | 2.776 | 1.563 |
-| JPY | 67 | 120.191 | 76.006 |
-
-Every currency in this dataset carries an `agreed_rate` that is essentially
-uncorrelated with the market rate — the values are synthetic noise. The ten `NIS`
-rows are the sole exception, centring on the `ILS` mid-rate at a ratio of 1.011
-with an order of magnitude less dispersion than any other currency. They were
-generated from real `ILS` rates while everything else was randomised.
-
-A consequence worth stating: because `agreed_rate` is uncorrelated with the
-market across the rest of the dataset, `weighted_avg_agreed_rate` is computed
-correctly but is not economically meaningful on this data. The arithmetic is
-right; the inputs are synthetic.
-
-**Decision.** An explicit alias map in `config.py` rewrites `NIS` to `ILS` during
-currency canonicalisation, applied to both `raw_trades` and `raw_fx_rates` so the
-two sides of the FX join stay consistent. The number of rewritten values is
-logged.
-
-**Rationale.** This is the defect that case folding cannot catch, and it is worth
-being precise about why. `NIS` is already three uppercase letters, so it passes
-the ISO 4217 *shape* test in section 7 and is never excluded. It then matches
-nothing in the rate feed. The result is a trade that survives every filter, is
-counted in `trade_count` and `total_amount_base`, and arrives in the fact table
-looking entirely healthy — with `fx_rate_source = 'not_found'` and a NULL USD
-exposure. Nothing errors and no count looks wrong. The requirement to normalise
-codes "to standard ISO 4217 format" is not satisfied by case folding alone; a
-code that is not an ISO code is exactly what that instruction is about.
-
-**On the boundary of this rule.** `SGD` also resolves to `not_found` — 73 trades
-— and is deliberately **left alone**. The distinction is the point: `NIS` is a
-documented alias for a currency the feed already carries, so resolving it
-recovers a rate that exists. `SGD` is a real ISO code for which no market data
-was supplied at all, so there is no rate to recover and a NULL exposure is the
-honest answer. Rewriting an alias and inventing a rate are different acts, and
-the alias map is an explicit whitelist rather than fuzzy matching so that the
-line between them stays visible.
-
-Were the pipeline to encounter further non-ISO codes, the correct response is to
-add them to the map deliberately after confirming the mapping — not to broaden
-the rule into guesswork.
+**The boundary.** `SGD` also resolves to `not_found` — 73 trades — and is
+deliberately left alone. `NIS` is an alias for a currency the feed already
+carries, so resolving it recovers a rate that exists; `SGD` is a real ISO code
+for which no market data was supplied, so there is nothing to recover and a NULL
+is the honest answer. Rewriting an alias and inventing a rate are different acts.
+Any further non-ISO code resolves to `not_found` until somebody adds it
+deliberately.
 
 ---
 
-## 7. Exclusions and filtering
+## 7. Exclusions
 
-Filters are applied in the following order, with a record count logged before and
-after each step:
+Applied in this fixed order, with a count logged at each step:
 
-1. Amount unit normalisation (no exclusion)
-2. Identifier and currency normalisation, including non-ISO alias resolution
-   (no exclusion — see section 6.1)
-3. Deduplicate `trade_id`, earliest `created_at`
-4. Exclude non-`ACTIVE` status
-5. Exclude `trade_date > 2026-06-01`
-6. Exclude NULL or unresolvable `client_id`
-7. Exclude NULL or non-conforming `base_currency` / `quote_currency`
-8. Exclude `amount <= 0`
-
-**Observed counts on the supplied data.** 692 raw rows, 15 superseded versions
-removed, 677 entering the filter chain:
-
-| Step | Excluded | Remaining |
+| # | Step | Excluded |
 |---|---|---|
-| Non-`ACTIVE` status | 133 | 544 |
-| `trade_date` after 2026-06-01 | 5 | 539 |
-| Missing or unresolvable `client_id` | 5 | 534 |
-| Missing or non-ISO-shaped currency | 4 | 530 |
-| Zero or negative amount | 3 | 527 |
+| 1 | Non-`ACTIVE` status | 133 |
+| 2 | `trade_date` missing or after 2026-06-01 | 5 |
+| 3 | `client_id` missing or unresolvable | 5 |
+| 4 | Currency missing or not `^[A-Z]{3}$` | 4 |
+| 5 | Amount missing, zero or negative | 3 |
 
-The status count reconciles as follows: 135 rows are non-`ACTIVE` in the raw
-table (79 `CANCELLED`, 56 `PENDING`), of which 2 were already removed as
-superseded duplicate versions, leaving 133 for this step to exclude. That gap is
-the deduplicate-before-filter ordering of section 4 made visible in the counts.
+692 raw → 15 superseded versions removed → 677 → 150 excluded → **527 retained**.
 
-**On the limits of the ISO shape test.** The currency exclusion tests that a code
-matches `^[A-Z]{3}$` after normalisation. That catches a NULL or a malformed
-value, but it cannot catch a well-formed code that is not an ISO one — which is
-the `NIS` case, and the reason alias resolution belongs in normalisation
-(step 2) rather than here. The 4 rows excluded at this step are all NULL
-`base_currency`.
+**Sequential, not independent.** A row violating several rules is attributed to
+the first it fails, so counts read as "removed at this step". 135 rows are
+non-`ACTIVE` in the raw table; 2 had already gone as superseded duplicates,
+leaving 133 — that gap is the §4 ordering, visible in the counts. The order is
+fixed so the numbers reproduce.
 
-**On overlapping exclusions.** A single row may violate several rules at once.
-Because filters are applied sequentially, each row is attributed to the *first*
-rule it fails, and the logged counts are therefore sequential rather than
-independent. They should be read as "removed at this step", not as "total rows
-violating this rule". The ordering above is fixed so that the counts are
-reproducible.
+**"Missing client information"** is read as covering both a NULL `client_id` and
+one with no match in the reference data. Only the NULL case occurs here, but an
+unresolvable reference is as much a gap as an absent one.
 
-**On "missing client information".** This is read as covering both NULL
-`client_id` and a `client_id` with no match in `raw_clients`. In this dataset
-only the NULL case occurs — every non-NULL identifier resolves after
-canonicalisation — but both are handled, since an unresolvable reference is as
-much a gap as an absent one.
-
-**On `trade_date` boundary.** `trade_date` is typed `DATE`, so the
-`<= 2026-06-01` comparison needs no cast and carries no risk of silently
-excluding same-day trades after midnight. Had it been a timestamp, an explicit
-cast would have been required.
+**`trade_date`** is typed `DATE`, so `<= 2026-06-01` needs no cast and cannot
+silently exclude same-day trades after midnight.
 
 ---
 
 ## 8. FX rate resolution
 
-**Requirement.** Prefer a direct rate; fall back to inverting a `USD → base`
-rate; otherwise flag as `not_found`.
+### 8.1 Clean the feed before deduplicating it
 
-### 8.1 Rate feed cleaning, and why order matters
-
-Invalid rates are excluded — NULL `mid_rate`, zero `mid_rate`, and NULL
-`rate_date` — **before** any deduplication of the rate feed.
-
-The feed contains two duplicate `(base_currency, quote_currency, rate_date)` keys,
-both from the same `source` (`reuters`), and in each case the duplicate pairs a
-**valid** rate with an invalid one:
+Invalid rates — NULL, zero, negative, or undated — are removed **before** any
+deduplication. This is load-bearing, not tidy. Both duplicate keys pair a valid
+rate with an invalid one:
 
 | Key | Rows |
 |---|---|
 | `ILS/USD` 2026-02-15 | `0.275537` and `0.0` |
 | `EUR/USD` 2026-02-20 | `1.085145` and NULL |
 
-This ordering is therefore load-bearing rather than merely tidy. Filtering first
-removes the invalid twin and leaves exactly one valid rate on each key.
-Deduplicating first — with an arbitrary "pick one" — could retain the zero on
-2026-02-15 and discard a perfectly good rate. Two real ILS trades fall on that
-date, so the consequence would have been two fact rows converting at a rate of
-nothing: `total_amount_usd = 0`, no error raised, and a zero indistinguishable
+Filter first and the good rate survives. Deduplicate first with an arbitrary pick
+and you can keep the zero — and two real ILS trades fall on 2026-02-15, so the
+consequence is two fact rows converting at a rate of nothing, indistinguishable
 from genuine zero exposure.
 
-The third invalid row, a `GBP/USD` rate with a NULL `rate_date`, is not part of a
-duplicate key and is simply dropped — it cannot be placed on a timeline.
+After filtering, uniqueness on `(base, quote, date)` is asserted. No source
+precedence rule is defined because post-filter none should be needed; if the
+assertion fires, the right response is to define one deliberately rather than to
+have guessed silently now. The check runs **before** the lookup is built, since
+once built a duplicate has already been resolved by the ranking tiebreak.
 
-After filtering, a uniqueness assertion is applied on
-`(base_currency, quote_currency, rate_date)`. No precedence rule between sources
-is defined, because none is needed: post-filter, exactly one row per key should
-remain. If that assertion ever fires, the correct response is to define a
-precedence rule deliberately, not to guess at one silently now.
-
-Negative rates are excluded alongside zeros. The requirement names only zero, but
-a negative FX rate is not a meaningful quantity, and inverting one would silently
-produce a negative converted amount rather than failing.
+Negative rates are excluded alongside zeros: the brief names only zero, but
+inverting a negative rate would silently produce a negative converted amount.
 
 ### 8.2 Direction of inversion
 
-The fact table converts a **base-currency** amount into USD, so for a trade with
-base currency X the pipeline needs an `X → USD` rate. Inversion therefore runs in
-one direction only: where no `X → USD` row exists but the feed carries `USD → X`,
-the rate is derived as `X → USD = 1 / (USD → X)`.
+The fact converts a **base** amount into USD, so for base currency X it needs
+`X → USD`. Where no such row exists but the feed carries `USD → X`, the rate is
+`1 / (USD → X)`. Inverting an existing `X → USD` row would give `USD → X`, which
+converts the wrong way.
 
-Inverting an existing `X → USD` row would instead yield `USD → X`, which converts
-USD amounts *into* X — the wrong direction for this pipeline, and unnecessary in
-any case, since a currency with a direct rate never reaches the inverse branch.
-
-**`quote_currency` plays no part in rate resolution.** It is a grain column of
-the fact table, but the lookup is keyed on `(base_currency, trade_date)` alone,
-because the measure being produced is the base amount expressed in USD — not the
-base amount expressed in the quote currency. Joining on the trade's own
+**`quote_currency` plays no part in resolution.** The lookup is keyed on
+`(base_currency, trade_date)` alone, because the measure is the base amount
+expressed in USD — not in the quote currency. Joining on the trade's own
 `quote_currency` would be a natural misreading and a damaging one: a trade quoted
-into anything other than USD would find no matching feed row and fall to
-`not_found` despite the feed carrying everything needed to convert it. On this
-data `quote_currency` is USD on every row, so the two readings coincide and the
-distinction is invisible in the output — which is exactly why it is recorded
-here rather than left to be inferred from the SQL.
+into anything but USD would fall to `not_found` despite the feed carrying what is
+needed. On this data `quote_currency` is USD on every row, so the two readings
+coincide and the distinction is invisible in the output — which is why it is
+recorded rather than left to be inferred from the SQL.
 
-### 8.3 Rate matrix and branch coverage
+### 8.3 What each branch actually does
 
-Read as a matrix against the trade currencies actually present, the feed
-determines exactly which branches are exercised:
-
-| Trade base currency | Resolution | Fact rows | Trades |
+| Base currency | Resolution | Fact rows | Trades |
 |---|---|---|---|
 | GBP, EUR, ILS, CHF, AUD, JPY | Direct `base → USD` | 376 | 387 |
 | CAD | Inverse of `USD → CAD` | 65 | 67 |
 | SGD | `not_found` — no feed coverage | 72 | 73 |
-| USD | Special case, rate `1.0` | 0 | 0 — USD is never a trade base currency |
+| USD | Parity, rate `1.0` | 0 | 0 — never a base currency |
 
-`USD → CAD` is the only row in the feed where USD appears as the base, so
-inversion can only ever serve CAD. CAD **is** a trade base currency — 79 raw
-rows, 67 after cleaning — and no `CAD → USD` row exists, so **every CAD trade
-takes the inverse branch**. It is exercised on real data, and the reciprocal
-direction of section 8.2 is what makes those 65 rows correct rather than
-inverted.
+`USD → CAD` is the only feed row with USD as base, so inversion can only serve
+CAD — and every CAD trade takes it, since no `CAD → USD` row exists.
 
-Two rows of this matrix are worth reading carefully because they cut in opposite
-directions:
+### 8.4 USD at parity
 
-- **`SGD` is genuinely unresolvable.** The feed contains no SGD row in any
-  position. `not_found` with a NULL exposure is the correct outcome, not a
-  failure to try — see section 6.1 for why this is treated differently from the
-  `NIS` alias, which *is* recoverable.
-- **The USD parity rule is defensive, not load-bearing.** Every trade in the
-  supplied data quotes *into* USD, so no trade has USD as its base and the
-  special case never fires. It is retained because the rule is correct and the
-  schema plainly permits a USD-base trade; it is covered by a synthetic fixture
-  rather than by production rows. The honest claim is that it prevents a future
-  defect, not that it prevents a current one.
+No `USD → USD` row exists, so a literal reading of the chain would send every USD
+trade to `not_found` with a NULL amount — plainly wrong for an identity
+conversion. USD-base trades get rate `1.0` labelled `direct`: the brief fixes the
+three permitted values, and an identity conversion is more honestly direct than
+not found. Applied before the lookup so it cannot be masked by a spurious feed
+row.
 
-### 8.4 USD-denominated trades
-
-**Observation.** No `USD → USD` row exists in the feed.
-
-**Decision.** USD-base trades are assigned a rate of `1.0` and labelled
-`direct`.
-
-**Rationale.** Followed literally, the direct/inverse/not_found chain would send
-every USD trade to `not_found` with a NULL converted amount, which is plainly
-wrong — a USD amount converted to USD is the amount itself. `direct` is chosen
-over inventing a fourth enum value because the requirement fixes the three
-permitted values, and an identity conversion is more honestly described as
-direct than as not found. The special case is applied before the lookup rather
-than as a fallback after it, so it cannot be masked by a spurious feed row.
-
-**Scope of this rule on the supplied data.** No trade in the source has USD as
-its base currency — `quote_currency` is USD on all 692 rows — so this branch is
-never taken in production. It is retained as defensive handling of a case the
-schema permits, and covered by a test fixture rather than by real rows.
+No trade in this data has USD as its base, so the branch is defensive and covered
+by a fixture rather than by real rows.
 
 ### 8.5 No temporal fallback
 
-**Observation.** The feed publishes rates on weekends and holidays, giving full
-calendar coverage across the trade date range.
-
-**Decision.** No carry-forward of the last known rate is implemented. The rate
-for a trade is taken from the trade date itself, or the row is flagged
-`not_found`.
-
-**Rationale.** Carry-forward is standard production practice where a market data
-feed follows a trading calendar and trades can land on non-publishing days. That
-condition does not hold here — the feed is complete across the calendar — so
-carry-forward would add unreachable complexity and deviate from a specification
-that defines only three resolution outcomes. Were the feed to move to a trading
-calendar, this is the decision that would need revisiting first.
+The feed has 156 distinct dates over a 156-day span — complete on a full
+calendar. Carry-forward of the last known rate would therefore add unreachable
+complexity and deviate from a specification defining only three outcomes. This is
+the first decision to revisit if the feed ever moves to a trading calendar.
 
 ### 8.6 Unconverted rows
 
-Where a rate resolves to `not_found`, `rate_used` is NULL and `total_amount_usd`
-is NULL rather than zero. A NULL correctly signals "not calculable"; a zero would
-be indistinguishable from a genuine zero-exposure row and would silently
-understate any downstream sum.
+Where a rate resolves to `not_found`, both `fx_rate_used` and `total_amount_usd`
+are NULL rather than zero. A zero is indistinguishable from genuine zero exposure
+and would silently understate any downstream sum.
 
 ---
 
 ## 9. Weighted average agreed rate
-
-**Decision.** `weighted_avg_agreed_rate` is the amount-weighted mean of
-`agreed_rate`, using the unit-normalised amount and evaluated within the
-`(date, client, base_currency, quote_currency)` group:
 
 ```sql
 sum(amount * agreed_rate) FILTER (WHERE agreed_rate IS NOT NULL)
   / nullif(sum(amount)    FILTER (WHERE agreed_rate IS NOT NULL), 0)
 ```
 
-**On the `FILTER` clauses.** `agreed_rate` was confirmed to contain **no NULLs,
-no zeros and no negative values** across all 692 source rows, so on this data the
-filters are inert and the expression reduces to `sum(amount * agreed_rate) /
-sum(amount)`. They are written explicitly anyway, because the plain form is
-wrong the moment a NULL appears: `sum(amount * agreed_rate)` would skip the NULL
-product while `sum(amount)` still counted that row's amount, dragging the average
-toward zero in proportion to the missing row's size. The failure would be a
-plausible-looking number rather than an error, which is the kind worth spending a
-`FILTER` clause on.
+Amount-weighted, using the unit-normalised amount, within the
+`(date, client, base_currency, quote_currency)` group.
 
-Two fixtures pin this, since the supplied data cannot:
-`test_null_agreed_rate_leaves_the_average_but_stays_in_the_totals` asserts the
-weighted average of a rated 1,000 and an unrated 3,000 is the rated trade's own
-rate rather than the 0.30 the plain form would produce, and
-`test_all_null_agreed_rates_yield_null_not_a_division_error` covers the
-all-NULL group.
+`agreed_rate` has no NULLs, zeros or negatives, so the `FILTER` clauses are inert
+here. They are written anyway because the plain form is wrong the moment a NULL
+appears: the numerator would skip the NULL product while the denominator still
+counted that row's amount, dragging the average toward zero in proportion to the
+missing row's size. That failure is a plausible number rather than an error.
 
-A row with a NULL `agreed_rate` therefore leaves both the numerator and the
-denominator, but is **retained** in `trade_count` and `total_amount_base` — the
-trade is real and its amount is known even where its rate is not. Where every row
-in a group has a NULL rate the result is NULL rather than a division error, and
-the pipeline logs a warning naming the affected row count.
+A NULL-rate row leaves both sides of the average but is **retained** in
+`trade_count` and `total_amount_base` — the trade is real and its amount is known
+even where its rate is not. A group where every rate is NULL yields NULL rather
+than a division error, and the count is logged. Two fixtures pin this, since the
+data cannot.
 
-Because amounts are already filtered to strictly positive values, the denominator
-cannot be zero for a group that exists.
+Amounts are already filtered to strictly positive, so the denominator cannot be
+zero for a group that exists.
 
 ---
 
 ## 10. Idempotency
 
-Running `python pipeline.py` twice produces identical table contents. Verified on
-the real source database by taking a SHA-256 over both output tables under an
-explicit `ORDER BY` on their key columns, across two consecutive runs: 18
-`dim_clients` rows and 513 `fact_daily_exposure` rows, identical digests both
-times.
+Two consecutive runs on the real database produce identical SHA-256 digests over
+both tables, taken under an explicit `ORDER BY`. The ordering matters:
+`CREATE OR REPLACE TABLE` guarantees identical *contents*, not identical physical
+row order, so hashing an unordered scan would test something the database does
+not promise — it could fail on a correct run or pass by luck.
 
-The ordering in that check is deliberate. `CREATE OR REPLACE TABLE` guarantees
-identical *contents*, not identical physical row order, so a hash taken over an
-unordered scan would be testing something the database does not promise — it
-could fail on a correct run, or pass by luck. Sorting first makes the check test
-idempotency rather than storage layout.
+It rests on four properties:
 
-Idempotency itself rests on four properties:
-
-- **Full replace, never append.** Target tables are written with
-  `CREATE OR REPLACE TABLE`, so a rerun cannot accumulate rows — and the whole
-  build runs in one transaction, so a rerun that fails partway leaves the
-  previous contents rather than a half-written mixture (section 11.1).
-- **Deterministic deduplication.** Version selection is ordered by `created_at`
-  and then by the row's own business columns, leaving no arbitrary choice and no
-  dependence on physical position.
-- **Deterministic rate resolution.** The uniqueness assertion on the cleaned rate
-  feed guarantees a single candidate per key, so no tiebreak is needed.
-- **No wall-clock or random inputs.** No `current_date`, `now()`, or generated
-  identifier participates in any output value. The `2026-06-01` cutoff is a
-  literal, not a relative date.
-
-The `target/` directory is created if absent, so the pipeline runs correctly from
-a clean checkout.
+- **Full replace, never append**, and the whole build runs in one transaction, so
+  a run that fails partway leaves the previous contents rather than a half-written
+  mixture (§11.1).
+- **Deterministic deduplication** — a total ordering over the row's own values,
+  with no dependence on physical position (§4).
+- **Deterministic rate resolution** — the uniqueness assertion guarantees a single
+  candidate per key.
+- **No wall-clock or random input.** No `current_date`, `now()` or generated
+  identifier participates in any output value; the `2026-06-01` cutoff is a
+  literal.
 
 ---
 
-## 11. Data quality assertions
+## 11. Data quality
 
-Beyond the required exclusion logging, the pipeline runs five assertions that
-**raise and roll back the load**, and one reconciliation that **warns without
-failing**. All six pass on the supplied data. Each of the five has a test that
-constructs the corruption it exists to catch and asserts that it raises — a check
+Six checks. Five **raise**; one **warns**. Each raising check has a test that
+constructs the corruption it exists to catch and asserts that it fires — a check
 never observed to fail is not known to work.
 
-Raising:
+| Check | Model | Catches |
+|---|---|---|
+| Change log orderable | `dim_clients` | same-date changes that cannot be sequenced (§3.3) |
+| Interval integrity | `dim_clients` | overlaps, gaps, zero-length intervals, multiple current rows |
+| Rate feed uniqueness | `fx_to_usd` | duplicate keys surviving cleaning (§8.1) |
+| Grain uniqueness | `fact_daily_exposure` | the declared grain violated — usually a dimension fan-out |
+| Trade reconciliation | `fact_daily_exposure` | rows lost *or* duplicated, in one check |
+| Segment chain (warns) | `dim_clients` | reference table disagreeing with the change log (§3.2) |
 
-1. **Rate feed key uniqueness** after invalid rows are filtered — see section 8.1.
-2. **Dimension interval integrity** — no overlapping intervals and no gaps within
-   a client's timeline, no zero-length or inverted intervals, and at most one
-   current row per client.
-3. **Fact grain uniqueness** — exactly one row per
-   `(trade_date, client_id, base_currency, quote_currency)`.
-4. **Trade count reconciliation** — the sum of `trade_count` in the fact table
-   equals the number of cleaned trades (527). This catches loss and duplication
-   in the same check: rows dropped by the inner dimension join, and rows
-   multiplied by a fan-out.
-5. **Conversion consistency** — a `not_found` row has a NULL `total_amount_usd`
-   and a resolved row does not, and no `fx_rate_used` is zero or negative.
+Plus conversion consistency: a `not_found` row with a USD amount, a resolved row
+without one, or a non-positive rate.
 
-Warning only:
+**Why raise.** Every failure above is silent by construction. A fan-out produces
+a well-formed table with inflated numbers and raises nothing; a dropped row just
+makes a total smaller. A partially-correct analytical table is worse than an
+absent one, because it will be trusted. The rule is: **raise when the output would
+be wrong, warn when an input is untidy but the output is unaffected.**
 
-6. **Segment chain reconciliation** — see section 3.2 for why this one does not
-   raise.
+### 11.1 Assertions decide; the transaction enforces
 
-**Why these, and why raising.** Every failure mode above is silent by
-construction. A fan-out from the dimension join or from a duplicate rate row does
-not raise an error; it produces a well-formed table with inflated numbers that
-looks entirely normal until somebody reconciles it against something else. A
-dropped row is worse still, because the total simply comes out lower and nothing
-indicates that it should not have. These are asserted rather than assumed
-precisely because inspection would not catch them.
+These are two mechanisms with different jobs, and separating them matters:
 
-A partially-correct analytical table is worse than an absent one, because it will
-be trusted. Where a check can distinguish "this output is wrong" from "this
-upstream input is untidy", it raises; where it cannot corrupt the output, it
-warns and names the count.
+- The **assertions** decide whether output is acceptable.
+- The **transaction** decides whether unacceptable output ever becomes visible.
 
-### 11.1 Checks must protect the target, not merely report on it
+Without the second, the first is only monitoring. `CREATE OR REPLACE TABLE`
+auto-commits, so a failing assertion would abort the run *after* the target had
+been replaced by the data it just rejected. Verified: injecting a bogus `0.5`
+`EUR/USD` rate makes the uniqueness check fire and the process exit 1, and leaves
+a fully written target in which that date's EUR exposure was converted at `0.5`
+instead of `1.085415` — understated by about half, with no error visible to any
+consumer.
 
-**Observation.** `CREATE OR REPLACE TABLE` is auto-committed in DuckDB, and the
-checks run last. Left that way, the checks detect corruption and *report* it,
-but do not *prevent* it: by the time an assertion fires, the target has already
-been overwritten with the data it is about to reject.
-
-This was verified rather than assumed. Injecting a second, bogus `EUR/USD` rate
-of `0.5` for 2026-01-05 makes the rate uniqueness assertion fire and the process
-exit `1` — and leaves a fully written target of 513 rows in which that date's EUR
-exposure was converted at `0.5` rather than the genuine `1.085415`, understating
-it by roughly half. The rate was chosen by the `ORDER BY` in the resolution
-window, which is a deterministic tiebreak, not a precedence rule anybody
-designed. A downstream consumer reading the target sees no error at all.
-
-**Decision.** The entire build, including `run_all_checks`, executes inside one
-explicit transaction. DDL in DuckDB is transactional, so a failing assertion
-rolls the whole build back and the last successful load remains in place. The
-rollback is logged explicitly so the operator knows the target is stale rather
-than wrong.
-
-**Rationale.** A check that cannot stop a bad load is a monitoring feature, not a
-control. The distinction matters most in exactly the case these assertions exist
-for — a silent corruption nobody is watching for — because the failure mode
-without a transaction is that the last known-good table is destroyed by the run
-that detected the problem. Exit code `1` is the right signal, but it only helps a
-caller that reads it; the data itself should be safe regardless.
-
-The cost is negligible at this volume, and measured: runs complete in 0.15–0.37s
-with the transaction, unchanged from before it. A production system at scale
-would want the same guarantee expressed as a blue/green swap or a staged
-publish rather than one long transaction, but the property being bought is
-identical.
-
-**Test.** `test_a_failed_check_leaves_the_previous_target_intact` builds a good
-target, corrupts the feed, asserts the second run raises, and asserts the target
-still holds the first run's rows byte-for-byte.
+DDL in DuckDB is transactional, so the whole build including its checks now runs
+in one transaction and a rejected load rolls back to the last good state. The
+rollback is logged explicitly, so an operator knows the data is stale rather than
+wrong. Measured cost is nil — runs complete in 0.15–0.37s either way.
 
 ---
 
 ## 12. Implementation structure
 
-**Decision.** One module per model, under `grain_pipeline/pipeline/`, with shared
-machinery in `grain_pipeline/utils/`. Each model owns its own staging, its own
-build and its own quality checks, and exposes a single
-`build(con, source_schema)`.
+One module per model, under `grain_pipeline/pipeline/`, with shared machinery in
+`grain_pipeline/utils/`. Each model owns its own sources, staging, build and
+quality checks behind a single `build(con, source_schema)`; `run.py` is three
+calls in dependency order.
 
-```
-pipeline/   dim_clients.py   fx_to_usd.py   fact_daily_exposure.py   run.py
-utils/      config.py   logging_setup.py   sql.py   filters.py   quality.py
-```
+**Why a model is the unit.** A model is the thing with one reason to change.
+Segmentation rules change: one file. A new currency alias: `config.py` alone. A
+second fact: a new file and one line in `run.py`. Organising by processing stage
+instead spreads each of those across several files and gives no file a single
+owner.
 
-**Why a model is the unit of decomposition.** A model is the thing that has one
-reason to change. When the segmentation rules change, exactly one file changes;
-when a new currency alias appears, `utils/config.py` changes and nothing else
-does; when a second fact is added, it is a new file and one line in `run.py`.
-Organising instead by processing stage — a staging module, a cleaning module, a
-dimension module — spreads every one of those changes across several files and
-gives no file a single owner.
+The decomposition also makes two stated requirements satisfiable — "at least 3
+meaningful unit tests covering actual business logic" and "log how many records
+are excluded at each filtering step" are both impossible inside one monolithic
+query.
 
-The decomposition is also what makes two stated requirements satisfiable. "At
-least 3 meaningful unit tests covering actual business logic" and "log how many
-records are excluded at each filtering step" are both impossible inside one
-monolithic query: there would be nothing to test in isolation and no intermediate
-count to observe.
+**Dependencies are data, not imports.** `fact_daily_exposure` reads `stg_clients`
+and `dim_clients` from the dimension, and `fx_to_usd` from the lookup. No model
+imports another; each declares its reads and writes in its docstring and `run.py`
+resolves the order. The import graph is acyclic and one-directional — `pipeline/`
+imports from `utils/`, never the reverse — and any model can be rebuilt in
+isolation against tables that already exist.
 
-### 12.1 Why the checks live with the models
+**`fx_to_usd` is an intermediate model**, not a dimension or a fact: not
+published to the target, and a conformed lookup any model needing USD conversion
+would join to. Folding it into the fact would make that fact the only model
+owning two unrelated sources.
 
-Each model asserts its own correctness inside its own `build()`, rather than a
-separate validation phase running every check at the end.
+**Checks live with their models** because a check is part of building a table
+correctly. This also fixed an ordering defect: the rate-feed assertion used to run
+after `fx_to_usd` was built, by which point a duplicate key had already been
+resolved by the ranking tiebreak.
 
-A check is part of building a table correctly, not a separate concern bolted on
-afterwards. Keeping them together means the guard and the thing it guards are
-read as one unit and change together — a new column with a new invariant does not
-require editing a distant file that nobody looks at while writing the query.
+**SQL rather than pandas.** Source and target are both DuckDB and the work is
+set-based; round-tripping through dataframes would add conversion cost and type
+drift for no benefit. `pandas` and `numpy` are in `requirements.txt` because the
+brief permits them, but neither is imported.
 
-It also fixes an ordering defect the previous arrangement had. The rate feed
-uniqueness assertion used to run *after* `fx_to_usd` was built, by which point a
-duplicate key had already been resolved by the `QUALIFY` tiebreak — the check was
-reporting on a decision that had silently already been taken. It now runs between
-staging and the lookup build, so it fires before anything acts on the ambiguity.
-
-`utils/quality.py` retains the framework: `DataQualityError`, and the `require` /
-`warn` / `passed` helpers that encode the severity rule of section 11.
-
-### 12.2 Dependencies between models
-
-`fact_daily_exposure` reads `stg_clients` and `dim_clients` from the dimension
-model, and `fx_to_usd` from the lookup. These are **data** dependencies, not
-imports: no model imports another. Each declares its reads and writes in its
-docstring and `run.py` resolves the order.
-
-That is the same contract a warehouse gives between models, and it is what allows
-any model to be rebuilt in isolation against tables that already exist. It also
-keeps the import graph acyclic and one-directional — `pipeline/` imports from
-`utils/`, never the reverse.
-
-### 12.3 `fx_to_usd` is an intermediate model
-
-It is neither a dimension nor a fact: it is not published to the target, and it
-is a conformed lookup any model needing a USD conversion would join to. It gets
-its own module for the reasons a dimension does — its own source, its own
-cleaning rules, its own quality check, one reason to change. Folding it into
-`fact_daily_exposure` would make that fact the only model owning two unrelated
-sources, and would bury a reusable lookup inside a single consumer.
-
-### 12.4 SQL rather than pandas
-
-Transformations are DuckDB SQL. Source and target are both DuckDB, the work is
-entirely set-based, and round-tripping through dataframes would add conversion
-cost and type drift for no benefit. `pandas` and `numpy` are available in
-`requirements.txt` but are not used; the requirement permits any of the listed
-libraries rather than mandating them, and reaching for one here would have made
-the code slower and harder to review.
-
-### 12.5 Testability
-
-Every transformation takes a connection and reads from named tables. The source
-database is attached as `src`, and DuckDB resolves `src.raw_trades` identically
+**Testability.** Each transformation takes a connection and reads named tables.
+The source is attached as `src`, and DuckDB resolves `src.raw_trades` identically
 whether `src` is an attached database or a plain schema — so the tests build an
-in-memory `src` schema and run the *production* SQL unmodified. The tests
-exercise the real logic rather than a Python reimplementation of it.
-
-**Scope of this structure.** At three models the layout is close to the minimum
-that separates business logic from machinery. It is deliberately the shape that
-grows: at twenty models the same layout takes `dimensions/`, `facts/` and
-`intermediate/` subdirectories under `pipeline/` without any model changing, and
-`run.py` becomes the place a real orchestrator plugs in. What it does *not*
-address is incremental loading — see section 13.
+in-memory `src` schema and run the *production* SQL unmodified.
 
 ---
 
-## 13. Known limitations
+## 13. Known limitations and open questions
 
-Deliberate scope boundaries, recorded so they are visible rather than accidental:
-
-- **Excluded rows are counted, not quarantined.** Production practice would route
-  rejected records to a quarantine table for investigation. Here they are logged
-  as counts only, per the stated requirement.
-- **The dimension is rebuilt in full on each run.** Appropriate at this data
-  volume and required for idempotency; a production SCD2 would apply incremental
-  merge logic against the existing dimension.
-- **No source precedence rule for FX rates.** Justified above — none is needed
-  post-filter, and the assertion will surface the need if the feed changes.
-- **The USD parity branch is covered by a synthetic fixture only.** No trade in
-  the supplied data has USD as its base currency, so section 8.4's rule is never
-  exercised in production. The `inverse` and `not_found` branches, by contrast,
-  are both exercised on real rows — see section 8.3.
-- **`trade_count` counts deduplicated trades**, not raw rows. Stated explicitly
-  because "number of trades" is ambiguous where the source contains duplicates.
-- **73 SGD trades carry no USD exposure.** The feed supplies no SGD rate in any
-  position, so `total_amount_usd` is NULL for those rows and any USD total
-  computed from this table excludes them. This is correct rather than
-  regrettable — the alternative is inventing a rate — but it is a real gap in
-  analytical coverage and belongs on this list rather than buried in a rate
-  source column. The fix is upstream: obtain SGD market data.
-- **The currency alias map is a whitelist of one.** `NIS → ILS` is resolved
-  because it was confirmed against the feed (section 6.1). Any further non-ISO
-  code will resolve to `not_found` until somebody adds it deliberately. That is
-  the intended failure mode — the alternative is fuzzy matching that silently
-  invents currency identities.
+- **`is_current` means "last interval in the chain", not "the interval containing
+  today".** These differ if a change is dated in the future. Not reachable here —
+  the latest change is 2026-03-15 — but a consumer using the flag for present-day
+  segmentation would get the wrong answer. Fixing it introduces a wall-clock
+  dependency, which is why it was avoided.
+- **No surrogate key on `dim_clients`**, and the fact stores no reference to the
+  dimension *version* that produced each row. Adequate at this size; at scale it
+  costs auditability (which version produced a historical fact?) and forces every
+  future fact to repeat the range join.
+- **`client_name` is carried in the fact.** Not required by the brief, and a
+  client-level attribute reachable through the join already needed for `segment`.
+  Denormalisation for query convenience, at the cost of a rename touching history.
+- **`agreed_rate` has no validation rule.** `amount` gets an exclusion and market
+  rates get zero/negative/NULL filtering plus a uniqueness assertion, but the
+  agreed rate has neither. For an FX business it is arguably the highest-value
+  number to check — at minimum non-null and positive, realistically a tolerance
+  band against the market rate, which this feed's full coverage would support.
+- **Nothing flags the share of unconverted exposure.** 72 of 513 fact rows (14%)
+  carry no USD figure. It is counted and internally consistent, but an upstream
+  outage pushing that to 60% would fire no check.
+- **Deduplicate-before-filter is a reading, not a resolved rule.** The risk
+  direction — dropping a genuine reinstatement versus keeping a stale
+  resubmission — is a business question (§4).
+- **A NULL `amount_in_thousands` defaults to `false`.** Never exercised, but the
+  default silently understates rather than inflates; quarantining is probably
+  better than either default (§5).
+- **Excluded rows are counted, not quarantined**, per the stated requirement.
+- **The dimension is rebuilt in full each run**, which is required for idempotency
+  at this size; a production SCD2 would merge incrementally.
+- **`trade_count` counts deduplicated trades**, not raw rows — stated because
+  "number of trades" is ambiguous where the source contains duplicates.

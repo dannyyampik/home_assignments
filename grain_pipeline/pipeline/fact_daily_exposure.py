@@ -173,7 +173,12 @@ def deduplicate_trades(con: duckdb.DuckDBPyConnection) -> None:
     Idempotency requires a total ordering, and ``created_at`` alone is not
     guaranteed unique. The tiebreak is therefore content-based rather than
     positional: physical row order is not a guarantee the database owes us across
-    runs, whereas ordering on the business columns is stable by construction.
+    runs, whereas ordering on the row's own values is stable by construction.
+
+    The ordering covers **every** column that can distinguish two versions of a
+    trade, not just the first few. Two rows tying on all of them are identical
+    rows, so which survives is immaterial — that is what makes this a total
+    order rather than merely a longer tiebreak (DECISIONS.md, section 4).
     """
     logger = get_logger()
 
@@ -200,11 +205,14 @@ def deduplicate_trades(con: duckdb.DuckDBPyConnection) -> None:
                 row_number() OVER (
                     PARTITION BY trade_id
                     ORDER BY
-                        created_at    NULLS LAST,
-                        amount        NULLS LAST,
-                        agreed_rate   NULLS LAST,
-                        status        NULLS LAST,
-                        base_currency NULLS LAST
+                        created_at     NULLS LAST,
+                        amount         NULLS LAST,
+                        agreed_rate    NULLS LAST,
+                        status         NULLS LAST,
+                        base_currency  NULLS LAST,
+                        quote_currency NULLS LAST,
+                        client_id      NULLS LAST,
+                        trade_date     NULLS LAST
                 ) AS _version_rank
             FROM trades_identified
         )

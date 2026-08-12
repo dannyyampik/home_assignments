@@ -2,7 +2,8 @@
 
 **Reads**  ``src.raw_clients``, ``src.raw_client_segment_changes``
 **Writes** ``stg_clients``, ``stg_segment_changes`` (temp), ``dim_clients``
-**Checks** interval integrity (raises), segment chain reconciliation (warns)
+**Checks** change-log orderability and interval integrity (raise), segment chain
+           reconciliation (warns)
 
 ``stg_clients`` is also read by ``fact_daily_exposure`` for its
 "client resolves to a known client" exclusion. That is a genuine cross-model
@@ -20,10 +21,20 @@ This has a consequence worth stating plainly. ``raw_clients`` is not a
 current-state reference table, so joining ``raw_clients.segment`` straight onto
 trades would stamp every trade with the client's *original* segment regardless of
 when it happened — the mirror image of the naive-current-segment bug the
-requirement warns about, and just as wrong. The dimension is therefore built from
-the change log, which is self-describing: every interval's segment comes from
-``from_segment`` or ``to_segment``, never from the reference table, except for
-clients that were never reclassified and for whom the two agree by definition.
+requirement warns about, and just as wrong.
+
+Both sources are therefore needed, for different things:
+
+* ``raw_clients`` defines the **client universe** and supplies names.
+* ``raw_client_segment_changes`` supplies the **history** for clients that have
+  one; each interval's segment comes from ``from_segment`` or ``to_segment``, so
+  the history is self-describing and does not depend on how
+  ``raw_clients.segment`` is interpreted.
+* A client with **no** change row has no history to reconstruct, and the change
+  log says nothing about them. Their single all-time interval necessarily takes
+  its segment from ``raw_clients`` — which is unambiguous precisely because,
+  never having been reclassified, their original and current segment are the
+  same value.
 
 Intervals are half-open — ``effective_start_date <= trade_date <
 effective_end_date`` — the only convention under which a trade falling exactly on
@@ -33,6 +44,11 @@ The current dataset holds at most one change per client, but the closing logic i
 written generically with ``lead()`` so that a client reclassified twice produces a
 correct interval chain without modification. This costs nothing today and avoids a
 rebuild the first time the assumption breaks.
+
+That generality has one boundary, and it is enforced rather than assumed: two
+changes for one client on the *same* date cannot be ordered, because the change
+log carries no sequence column. ``assert_change_log_orderable`` fails the load
+instead of resolving the tie arbitrarily.
 """
 
 from __future__ import annotations
@@ -217,6 +233,41 @@ def build_dimension(con: duckdb.DuckDBPyConnection) -> None:
 # --- checks ----------------------------------------------------------------
 
 
+def assert_change_log_orderable(con: duckdb.DuckDBPyConnection) -> None:
+    """One change per client per ``effective_date``.
+
+    The interval chain is built with ``lead(effective_date) OVER (PARTITION BY
+    client_id ORDER BY effective_date)``. Two changes for one client on the *same*
+    date give that ordering nothing to work with: the tie resolves arbitrarily,
+    one interval collapses to zero length and is dropped by the positive-length
+    filter, and a segment silently disappears from the client's history.
+
+    Nothing downstream would notice. The resulting chain is still contiguous,
+    non-overlapping and single-current, so ``assert_intervals_valid`` passes — the
+    output is structurally valid and semantically wrong, which is the failure mode
+    this whole pipeline is built to refuse.
+
+    The change log carries no sequence column, so there is no correct answer to
+    guess at; the honest response is to declare the ordering assumption as a
+    contract and fail when it is violated (DECISIONS.md, section 3.3).
+    """
+    require(
+        scalar(
+            con,
+            """
+            SELECT count(*) FROM (
+                SELECT 1 FROM stg_segment_changes
+                GROUP BY client_id, effective_date HAVING count(*) > 1
+            )
+            """,
+        ),
+        "{count} (client_id, effective_date) pairs have more than one segment change. "
+        "The change log carries no sequence column, so their order — and therefore the "
+        "resulting segment history — is undefined. A tiebreaking column is required.",
+    )
+    passed("Segment change log has at most one change per client per date.")
+
+
 def assert_intervals_valid(con: duckdb.DuckDBPyConnection) -> None:
     """No overlapping or gapped intervals within a client's timeline."""
     require(
@@ -326,6 +377,7 @@ def build(con: duckdb.DuckDBPyConnection, source_schema: str = SOURCE_SCHEMA) ->
     """Run the whole ``dim_clients`` process: stage, build, validate."""
     stage_clients(con, source_schema)
     stage_segment_changes(con, source_schema)
+    assert_change_log_orderable(con)
     build_dimension(con)
     assert_intervals_valid(con)
     reconcile_segment_chain(con)

@@ -24,7 +24,7 @@ pip install -r requirements.txt
 mkdir -p source_data && cp /path/to/grain_raw.duckdb source_data/
 
 python pipeline.py        # builds target/grain_analytics.duckdb
-python -m pytest -q       # 33 tests
+python -m pytest -q       # 35 tests
 ```
 
 The run prints its progress to stdout and mirrors it to `logs/pipeline.log`.
@@ -138,7 +138,7 @@ grain_pipeline/
 
 tests/
     conftest.py              in-memory `src` schema fixtures and row builders
-    test_pipeline.py         33 tests
+    test_pipeline.py         35 tests
 
 target/grain_analytics.duckdb    the built output
 logs/pipeline.log                the most recent run's log
@@ -473,7 +473,7 @@ same file as the rule:
 
 ## Tests
 
-33 tests in `tests/test_pipeline.py`, organised into eight sections.
+35 tests in `tests/test_pipeline.py`, organised into eight sections.
 
 ### How they work
 
@@ -581,7 +581,7 @@ Running a subset:
 ```bash
 python -m pytest -q -k dedup          # deduplication tests
 python -m pytest -q -k "rate or fx"   # FX resolution tests
-python -m pytest -v                   # names of all 33
+python -m pytest -v                   # names of all 35
 ```
 
 ---
