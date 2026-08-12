@@ -722,26 +722,93 @@ still holds the first run's rows byte-for-byte.
 
 ## 12. Implementation structure
 
-Two requirements are really design constraints, and the structure follows from
-them. "At least 3 meaningful unit tests covering actual business logic" and "log
-how many records are excluded at each filtering step" are both unsatisfiable by a
-single monolithic query — there would be nothing to test in isolation and no
-intermediate count to observe. The logic is therefore decomposed into a staging
-layer, a counted filter chain, and separate dimension, rate and fact builds.
+**Decision.** One module per model, under `grain_pipeline/pipeline/`, with shared
+machinery in `grain_pipeline/utils/`. Each model owns its own staging, its own
+build and its own quality checks, and exposes a single
+`build(con, source_schema)`.
 
-Transformations are DuckDB SQL rather than pandas. Source and target are both
-DuckDB, the work is entirely set-based, and round-tripping through dataframes
-would add conversion cost and type drift for no benefit. `pandas` and `numpy` are
-available in `requirements.txt` but are not used; the requirement permits any of
-the listed libraries rather than mandating them, and reaching for one here would
-have made the code slower and harder to review.
+```
+pipeline/   dim_clients.py   fx_to_usd.py   fact_daily_exposure.py   run.py
+utils/      config.py   logging_setup.py   sql.py   filters.py   quality.py
+```
 
-Testability is preserved by having each transformation take a connection and read
-from named tables. The source database is attached as `src`, and DuckDB resolves
-`src.raw_trades` identically whether `src` is an attached database or a plain
-schema — so the tests build an in-memory `src` schema and run the *production* SQL
-unmodified. The tests exercise the real logic rather than a Python
-reimplementation of it.
+**Why a model is the unit of decomposition.** A model is the thing that has one
+reason to change. When the segmentation rules change, exactly one file changes;
+when a new currency alias appears, `utils/config.py` changes and nothing else
+does; when a second fact is added, it is a new file and one line in `run.py`.
+Organising instead by processing stage — a staging module, a cleaning module, a
+dimension module — spreads every one of those changes across several files and
+gives no file a single owner.
+
+The decomposition is also what makes two stated requirements satisfiable. "At
+least 3 meaningful unit tests covering actual business logic" and "log how many
+records are excluded at each filtering step" are both impossible inside one
+monolithic query: there would be nothing to test in isolation and no intermediate
+count to observe.
+
+### 12.1 Why the checks live with the models
+
+Each model asserts its own correctness inside its own `build()`, rather than a
+separate validation phase running every check at the end.
+
+A check is part of building a table correctly, not a separate concern bolted on
+afterwards. Keeping them together means the guard and the thing it guards are
+read as one unit and change together — a new column with a new invariant does not
+require editing a distant file that nobody looks at while writing the query.
+
+It also fixes an ordering defect the previous arrangement had. The rate feed
+uniqueness assertion used to run *after* `fx_to_usd` was built, by which point a
+duplicate key had already been resolved by the `QUALIFY` tiebreak — the check was
+reporting on a decision that had silently already been taken. It now runs between
+staging and the lookup build, so it fires before anything acts on the ambiguity.
+
+`utils/quality.py` retains the framework: `DataQualityError`, and the `require` /
+`warn` / `passed` helpers that encode the severity rule of section 11.
+
+### 12.2 Dependencies between models
+
+`fact_daily_exposure` reads `stg_clients` and `dim_clients` from the dimension
+model, and `fx_to_usd` from the lookup. These are **data** dependencies, not
+imports: no model imports another. Each declares its reads and writes in its
+docstring and `run.py` resolves the order.
+
+That is the same contract a warehouse gives between models, and it is what allows
+any model to be rebuilt in isolation against tables that already exist. It also
+keeps the import graph acyclic and one-directional — `pipeline/` imports from
+`utils/`, never the reverse.
+
+### 12.3 `fx_to_usd` is an intermediate model
+
+It is neither a dimension nor a fact: it is not published to the target, and it
+is a conformed lookup any model needing a USD conversion would join to. It gets
+its own module for the reasons a dimension does — its own source, its own
+cleaning rules, its own quality check, one reason to change. Folding it into
+`fact_daily_exposure` would make that fact the only model owning two unrelated
+sources, and would bury a reusable lookup inside a single consumer.
+
+### 12.4 SQL rather than pandas
+
+Transformations are DuckDB SQL. Source and target are both DuckDB, the work is
+entirely set-based, and round-tripping through dataframes would add conversion
+cost and type drift for no benefit. `pandas` and `numpy` are available in
+`requirements.txt` but are not used; the requirement permits any of the listed
+libraries rather than mandating them, and reaching for one here would have made
+the code slower and harder to review.
+
+### 12.5 Testability
+
+Every transformation takes a connection and reads from named tables. The source
+database is attached as `src`, and DuckDB resolves `src.raw_trades` identically
+whether `src` is an attached database or a plain schema — so the tests build an
+in-memory `src` schema and run the *production* SQL unmodified. The tests
+exercise the real logic rather than a Python reimplementation of it.
+
+**Scope of this structure.** At three models the layout is close to the minimum
+that separates business logic from machinery. It is deliberately the shape that
+grows: at twenty models the same layout takes `dimensions/`, `facts/` and
+`intermediate/` subdirectories under `pipeline/` without any model changing, and
+`run.py` becomes the place a real orchestrator plugs in. What it does *not*
+address is incremental loading — see section 13.
 
 ---
 

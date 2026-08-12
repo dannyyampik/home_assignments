@@ -1,6 +1,17 @@
 """Pipeline orchestration.
 
-Idempotency rests on four properties, all visible here:
+One call per model, in dependency order. Each model owns its own staging, its
+own build and its own quality checks, so this function reads as a dependency
+graph rather than as a procedure:
+
+    dim_clients      (no upstream model)
+    fx_to_usd        (no upstream model)
+    fact_daily_exposure  (reads stg_clients, dim_clients, fx_to_usd)
+
+Adding a model means adding a module and one line here. Nothing else in the
+project needs to know about it.
+
+Idempotency rests on four properties:
 
 * Target tables are written with CREATE OR REPLACE, never appended to.
 * Deduplication and rate selection are deterministic, with explicit tiebreaks.
@@ -9,14 +20,14 @@ Idempotency rests on four properties, all visible here:
 * The target directory is created if absent, so a clean checkout runs.
 
 The whole build runs inside a single transaction, which is what makes the
-quality checks in ``quality.py`` protective rather than merely informative. DDL
-in DuckDB is transactional, and ``CREATE OR REPLACE TABLE`` would otherwise
-auto-commit each output table *before* ``run_all_checks`` runs — so a failing
-assertion would abort the process only after the target had already been
-overwritten with data it had just rejected. The previous, good tables would be
-gone and only a non-zero exit code would say so. Building and checking inside
-one transaction means a rejected load leaves the last known-good target intact
-(DECISIONS.md, section 11.1).
+quality checks protective rather than merely informative. DDL in DuckDB is
+transactional, and ``CREATE OR REPLACE TABLE`` would otherwise auto-commit each
+output table *before* the checks that guard it run — so a failing assertion
+would abort the process only after the target had already been overwritten with
+data it had just rejected. The previous, good tables would be gone and only a
+non-zero exit code would say so. Building and checking inside one transaction
+means a rejected load leaves the last known-good target intact (DECISIONS.md,
+section 11.1).
 """
 
 from __future__ import annotations
@@ -26,42 +37,20 @@ from pathlib import Path
 
 import duckdb
 
-from .cleaning import apply_filters, deduplicate_trades
-from .config import SOURCE_DB, SOURCE_SCHEMA, TARGET_DB
-from .dimensions import build_dim_clients
-from .facts import build_fact_daily_exposure, build_trades_enriched
-from .logging_setup import configure_logging
-from .quality import run_all_checks
-from .rates import build_fx_to_usd
-from .staging import (
-    build_stg_clients,
-    build_stg_fx_rates,
-    build_stg_segment_changes,
-    build_stg_trades,
-)
+from ..utils.config import SOURCE_DB, SOURCE_SCHEMA, TARGET_DB
+from ..utils.logging_setup import configure_logging, get_logger
+from . import dim_clients, fact_daily_exposure, fx_to_usd
 
 
 def build_analytics(con: duckdb.DuckDBPyConnection, source_schema: str = SOURCE_SCHEMA) -> None:
-    """Run every transformation against an open connection.
+    """Run every model against an open connection, in dependency order.
 
     Separated from connection management so the tests can drive the full
     pipeline against an in-memory database.
     """
-    build_stg_clients(con, source_schema)
-    build_stg_segment_changes(con, source_schema)
-    build_stg_trades(con, source_schema)
-    build_stg_fx_rates(con, source_schema)
-
-    deduplicate_trades(con)
-    apply_filters(con)
-
-    build_dim_clients(con)
-    build_fx_to_usd(con)
-
-    build_trades_enriched(con)
-    build_fact_daily_exposure(con)
-
-    run_all_checks(con)
+    dim_clients.build(con, source_schema)
+    fx_to_usd.build(con, source_schema)
+    fact_daily_exposure.build(con, source_schema)
 
 
 def run_pipeline(source_db: Path = SOURCE_DB, target_db: Path = TARGET_DB) -> None:
@@ -95,7 +84,7 @@ def run_pipeline(source_db: Path = SOURCE_DB, target_db: Path = TARGET_DB) -> No
                 build_analytics(con, SOURCE_SCHEMA)
             except Exception:
                 con.execute("ROLLBACK")
-                logger.error(
+                get_logger().error(
                     "Build rolled back. The target database is unchanged and still holds "
                     "the last successful load."
                 )

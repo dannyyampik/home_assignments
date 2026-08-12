@@ -120,15 +120,21 @@ README.md                    this file
 
 grain_pipeline/
     __init__.py              package docstring, re-exports run_pipeline
-    config.py                every business literal in one place
-    logging_setup.py         stdout + logs/pipeline.log
-    staging.py               all normalisation
-    cleaning.py              deduplication, then the counted filter chain
-    dimensions.py            dim_clients (Type 2 SCD)
-    rates.py                 direct / inverse rate resolution to USD
-    facts.py                 point-in-time join, then the daily aggregate
-    quality.py               assertions that fail loudly, plus one that warns
-    run.py                   orchestration and connection management
+
+    pipeline/                one module per model — the business logic
+        __init__.py
+        dim_clients.py           Type 2 SCD over client segmentation
+        fx_to_usd.py             intermediate: base -> USD rate per (currency, date)
+        fact_daily_exposure.py   daily FX exposure at the declared grain
+        run.py                   orchestration and connection management
+
+    utils/                   shared machinery — no business logic
+        __init__.py
+        config.py                every business literal in one place
+        logging_setup.py         stdout + logs/pipeline.log
+        sql.py                   reusable SQL fragments and count helpers
+        filters.py               FilterStep and the counted exclusion chain
+        quality.py               DataQualityError, require / warn / passed
 
 tests/
     conftest.py              in-memory `src` schema fixtures and row builders
@@ -138,27 +144,56 @@ target/grain_analytics.duckdb    the built output
 logs/pipeline.log                the most recent run's log
 ```
 
+**One module per process.** Each model under `pipeline/` owns everything needed
+to produce its table — reading its own sources, staging them, building the
+output, and asserting its own correctness — and exposes it as a single
+`build(con, source_schema)`. A model is the unit of change: adding one means
+adding a file and a line in `run.py`, and nothing else in the project needs to
+know about it.
+
+That is why `utils/` exists as a separate package. It holds what every model
+reuses and nothing specific to any of them, which is what keeps the models
+comparable: two models that normalise an identifier call the same fragment
+rather than each spelling out `upper(nullif(trim(...), ''))`.
+
+`fx_to_usd` is an *intermediate* model rather than a dimension or a fact — it is
+not published to the target, it is a conformed lookup that any model needing a
+USD conversion joins to. It gets its own module for the same reasons a dimension
+does: its own source, its own cleaning rules, its own quality check, and exactly
+one reason to change.
+
 ### Dependency structure
 
-Strictly two-layer, no cycles:
+Two packages, one direction of dependency. `pipeline/` imports from `utils/`;
+`utils/` imports nothing from `pipeline/`.
 
 ```
-config.py ──> logging_setup.py ──┐
-    │                            │
-    └────────────────────────────┴──> staging  cleaning  dimensions
-                                      rates    facts     quality
-                                                 │
-                                                 └──> run.py ──> pipeline.py
+utils/config.py ──> utils/logging_setup.py ──┐
+       │                                     │
+       ├──> utils/sql.py ────────────────────┤
+       ├──> utils/filters.py ────────────────┤
+       └──> utils/quality.py ────────────────┘
+                                             │
+                                             v
+              pipeline/dim_clients.py    pipeline/fx_to_usd.py
+                        │                          │
+                        └──> pipeline/fact_daily_exposure.py
+                                       │
+                                       └──> pipeline/run.py ──> pipeline.py
 ```
 
-`config.py` and `logging_setup.py` are leaves. Every transformation module
-depends on those two and nothing else, which is what allows any of them to be
-imported and driven in isolation by a test. `run.py` is the only module that
-knows about the others.
+The arrow from the dimension and the lookup into the fact is a **data**
+dependency, not an import: `fact_daily_exposure` reads the `stg_clients` and
+`dim_clients` tables the dimension model produced, and the `fx_to_usd` table the
+lookup produced. Models never import one another — they depend on one another's
+outputs, and `run.py` resolves the order. That is the same contract a warehouse
+gives you between models, and it is what allows any model to be rebuilt in
+isolation against tables that already exist.
 
-This is also why `logging_setup.py` is a separate module rather than part of
-`run.py`: every transformation calls `get_logger()`, so putting it in `run.py` —
-which imports every transformation — would be a circular import.
+`config.py` and `logging_setup.py` are leaves within `utils/`. `logging_setup` is
+its own module rather than part of `run.py` because every model calls
+`get_logger()` — putting it in `run.py`, which imports every model, would be a
+circular import.
 
 ---
 
@@ -171,138 +206,53 @@ The entry point the brief requires. A thin wrapper: it puts the project root on
 `run_pipeline()`, and converts an uncaught exception into a logged error and exit
 code `1`. No business logic.
 
-### `grain_pipeline/config.py`
+---
 
-Every business literal, so that no value is buried in a query and a reviewer can
-see all of them at once:
+### The models — `grain_pipeline/pipeline/`
 
-- paths (`SOURCE_DB`, `TARGET_DB`, `LOG_FILE`) derived from the project root
-- `SOURCE_SCHEMA = "src"` — the name the source database is attached under
-- `TRADE_DATE_CUTOFF`, `ACTIVE_STATUS`, `USD`
-- `DATE_FLOOR` / `DATE_CEILING` — the SCD2 sentinel bounds
-- `ISO_4217_PATTERN` — `^[A-Z]{3}$`
-- `CURRENCY_ALIASES` — `{"NIS": "ILS"}`, the non-ISO codes to resolve
-- the three `fx_rate_source` enum values
+Each exposes `build(con, source_schema)` and can be driven in isolation. Every
+one declares its reads, writes and checks in its module docstring.
 
-Keeping these here is also what makes the idempotency claim checkable: no
-`current_date` or `now()` appears anywhere, so there is one place to verify that.
+#### `dim_clients.py`
 
-### `grain_pipeline/logging_setup.py`
+**Reads** `src.raw_clients`, `src.raw_client_segment_changes` · **Writes**
+`stg_clients`, `stg_segment_changes`, `dim_clients` · **Checks** interval
+integrity (raises), segment chain reconciliation (warns)
 
-Configures a named logger writing to both stdout and `logs/pipeline.log`.
+`stage_clients` canonicalises identifiers and collapses the case and whitespace
+variants (`c007`/`C007`, `C003`/`C003 `) that would otherwise fan out the
+dimension join. `stage_segment_changes` drops rows with no effective date, which
+cannot be placed on a timeline.
 
-The exclusion counts are a **stated deliverable**, not debug output, so they go
-through the logging framework rather than `print()`. `configure_logging()` is
-idempotent — calling it twice does not duplicate handlers — and degrades to
-stdout alone if the log file cannot be opened, on the grounds that losing a log
-file is recoverable and losing the load is not.
-
-### `grain_pipeline/staging.py`
-
-All normalisation, before any filtering or joining. Four builders, each producing
-a temp table:
-
-| Function | Output | Does |
-|---|---|---|
-| `build_stg_trades` | `stg_trades` | amount units, identifiers, currencies, status |
-| `build_stg_clients` | `stg_clients` | canonicalises and collapses duplicate client identifiers |
-| `build_stg_segment_changes` | `stg_segment_changes` | canonicalises; drops rows with no effective date |
-| `build_stg_fx_rates` | `stg_fx_rates` | canonicalises; removes invalid rates |
-
-Two helpers carry most of the logic:
-
-- `_canonical_text(col)` → `upper(nullif(trim(col), ''))`. Trims, uppercases, and
-  folds the empty string to NULL so a blank identifier is handled by the same
-  exclusion as a true NULL.
-- `_canonical_currency(col)` → the above, plus a `CASE` resolving
-  `CURRENCY_ALIASES`. Built from the config dict, so adding an alias needs no
-  change here.
-
-**Ordering is the point of this module,** and three orderings are deliberate:
-
-1. **Amount units before deduplication** — so `5000/false` and `5/true` are seen
-   as the same value rather than as a real discrepancy.
-2. **Currency normalisation before the missing-currency exclusion** — so `usd`
-   and `" Eur "` are not discarded as malformed.
-3. **Alias resolution as part of normalisation, not as a filter** — `NIS` is
-   already three uppercase letters, so it passes the ISO *shape* test and is
-   never excluded; it simply matches nothing in the rate feed. See
-   `DECISIONS.md` §6.1.
-
-The same normalisation is applied to `raw_fx_rates` as to `raw_trades`, so both
-sides of the FX join see one spelling per currency.
-
-`_log_currency_aliases()` reports how many values each alias rewrote, so the
-remap is visible rather than silent.
-
-### `grain_pipeline/cleaning.py`
-
-Deduplication, then the counted exclusion chain.
-
-`deduplicate_trades()` reduces `stg_trades` to one row per `trade_id`, keeping
-the earliest `created_at`. The tiebreak is **content-based** — `amount`,
-`agreed_rate`, `status`, `base_currency` — rather than positional, because
-physical row order (`rowid`, or an unordered scan) is not a guarantee the
-database owes us across runs, and idempotency requires a total ordering.
-
-Deduplication runs **before** the filters. See `DECISIONS.md` §4 — this is one of
-the decisions most worth understanding, because "keep the earliest version" and
-"include only ACTIVE trades" conflict when versions disagree on status.
-
-`apply_filters()` walks `FILTER_STEPS`, a tuple of `FilterStep(name, predicate,
-description)` records. For each step it creates the next filtered table, counts
-what was removed, logs it, and swaps the tables. It **returns** the counts as a
-dict as well as logging them, which is what lets a test assert on the exclusions
-rather than parse log output:
-
-```python
-exclusions = apply_filters(con)
-assert exclusions["missing_or_invalid_currency"] == 1
-```
-
-The steps, in fixed order:
-
-| Step | Excludes |
-|---|---|
-| `non_active_status` | status is not `ACTIVE` |
-| `after_cutoff_date` | `trade_date` missing or after 2026-06-01 |
-| `missing_client` | `client_id` NULL or not resolving to a known client |
-| `missing_or_invalid_currency` | base/quote currency NULL or not ISO-shaped |
-| `non_positive_amount` | amount NULL, zero or negative |
-
-Because the filters are sequential, a row violating several rules is attributed
-to the **first** one it fails. The counts are "removed at this step", not "total
-rows violating this rule". The order is fixed so the numbers are reproducible.
-
-### `grain_pipeline/dimensions.py`
-
-Builds `dim_clients` as a Type 2 SCD from three interval sets unioned together:
+`build_dimension` unions three interval sets:
 
 - `pre_change_intervals` — floor date until a client's first change, carrying
   `from_segment`
 - `post_change_intervals` — each change until the next, or until the ceiling
-  sentinel for the most recent; carries `to_segment`, closed with
-  `lead(effective_date) OVER (PARTITION BY client_id ORDER BY effective_date)`
+  sentinel for the most recent, closed with `lead(effective_date) OVER
+  (PARTITION BY client_id ORDER BY effective_date)`
 - `unchanged_intervals` — one all-time row for clients with no change record
 
 History is built **forward**, because `raw_clients.segment` matches
-`from_segment` in the change log — meaning the reference table holds each
-client's *original* classification, not their current one. The dimension is
-therefore built from the change log alone, which is self-describing. See
-`DECISIONS.md` §3.1: joining `raw_clients.segment` onto trades directly would
-stamp every trade with the client's *original* segment regardless of date — the
-mirror image of the naive current-segment bug, and harder to spot.
+`from_segment` — the reference table holds each client's *original*
+classification. Joining it onto trades directly would stamp every trade with the
+original segment regardless of date: the mirror image of the naive
+current-segment bug, and harder to spot. See `DECISIONS.md` §3.1.
 
-The `lead()` closing logic is generic, so a client reclassified two or more times
-produces a correct chain without modification, even though the supplied data has
-at most one change each.
+`stg_clients` is also read by `fact_daily_exposure`, which is why `run.py` builds
+this model first.
 
-### `grain_pipeline/rates.py`
+#### `fx_to_usd.py`
 
-Builds `fx_to_usd`: one resolved rate per `(currency, date)`.
+**Reads** `src.raw_fx_rates` · **Writes** `stg_fx_rates`, `fx_to_usd` · **Checks**
+rate feed key uniqueness (raises)
 
-The fact converts a **base-currency** amount into USD, so for base currency X the
-pipeline needs `X → USD`. Two candidate sources are unioned and ranked:
+`stage_fx_rates` removes invalid rates — NULL, zero, negative, or undated —
+*before* any deduplication, which is load-bearing: both duplicate keys in the
+feed pair a **valid** rate with an invalid one, so filtering first keeps the good
+rate where deduplicating first could keep the zero (`DECISIONS.md` §8.1).
+
+`build_lookup` unions two candidate sources and ranks them:
 
 | Source | Condition | Rate | Preference |
 |---|---|---|---|
@@ -310,35 +260,44 @@ pipeline needs `X → USD`. Two candidate sources are unioned and ranked:
 | `inverse` | feed row `USD → X` | `1 / mid_rate` | 1 |
 
 `QUALIFY row_number() OVER (PARTITION BY currency, rate_date ORDER BY preference,
-rate_to_usd) = 1` makes direct win wherever both exist, per the requirement.
+rate_to_usd) = 1` makes direct win wherever both exist.
 
-**Direction matters.** Inversion is `X → USD = 1 / (USD → X)`. Inverting an
-existing `X → USD` row would give `USD → X`, which converts the wrong way.
+**Direction matters.** Inversion is `X → USD = 1 / (USD → X)`; inverting an
+existing `X → USD` row would give `USD → X`, which converts the wrong way. Note
+also that `quote_currency` plays **no part** in resolution — the lookup is keyed
+on `(base_currency, rate_date)` because the measure is the base amount expressed
+in USD. See `DECISIONS.md` §8.2.
 
-This module reads the already-cleaned `stg_fx_rates`, so it needs no guard
-against zero or NULL rates — which matters, because the inverse branch divides by
-the rate.
+The uniqueness check runs *between* staging and the lookup build, not after it:
+once the lookup exists a duplicate key has already been resolved by the `QUALIFY`
+tiebreak, and the check would be reporting on a decision silently already taken.
 
-Note that `quote_currency` plays **no part** in rate resolution — the lookup is
-keyed on `(base_currency, trade_date)` alone, because the measure is the base
-amount expressed in USD. See `DECISIONS.md` §8.2.
+#### `fact_daily_exposure.py`
 
-### `grain_pipeline/facts.py`
+**Reads** `src.raw_trades`, plus `stg_clients` / `dim_clients` / `fx_to_usd` from
+the models above · **Writes** `stg_trades`, `trades_deduplicated`,
+`trades_clean`, `trades_enriched`, `fact_daily_exposure` · **Checks** grain
+uniqueness, trade reconciliation, conversion consistency (all raise)
 
-Two stages, so each is legible and separately testable.
+Five stages, each separately testable:
 
-`build_trades_enriched()` attaches to each cleaned trade:
+1. **`stage_trades`** — amount units, identifiers, currencies and status. Amount
+   normalisation runs before deduplication, so `5000/false` and `5/true` are
+   recognised as the same value; currency normalisation runs before the
+   missing-currency exclusion, so `usd` is not discarded as malformed. Non-ISO
+   aliases are resolved here too, and the rewritten count is logged.
+2. **`deduplicate_trades`** — one row per `trade_id`, earliest `created_at`
+   wins, with a **content-based** tiebreak (`amount`, `agreed_rate`, `status`,
+   `base_currency`) rather than a positional one, because physical row order is
+   not a guarantee the database owes us across runs.
+3. **`apply_filters`** — delegates to `utils/filters.py` with `FILTER_STEPS`.
+4. **`build_trades_enriched`** — inner join to `dim_clients` over the half-open
+   interval for the point-in-time segment, left join to `fx_to_usd` for the rate.
+   USD-base trades are special-cased to `1.0`/`direct` *before* the lookup, so
+   the identity conversion cannot be masked by a spurious feed row.
+5. **`build_fact`** — groups to the declared grain.
 
-- the **point-in-time segment**, via an inner join to `dim_clients` on
-  `trade_date >= effective_start_date AND trade_date < effective_end_date`
-- the **USD rate**, via a left join to `fx_to_usd` on currency and date
-
-USD-base trades are special-cased to rate `1.0` / `direct` *before* the lookup,
-so the identity conversion cannot be masked by a spurious feed row. An unmatched
-left join produces `coalesce(r.rate_source, 'not_found')`.
-
-`build_fact_daily_exposure()` groups to the declared grain. Two aggregates
-deserve attention:
+Two aggregates deserve attention:
 
 ```sql
 sum(amount * agreed_rate) FILTER (WHERE agreed_rate IS NOT NULL)
@@ -356,63 +315,94 @@ sum(amount * fx_rate_used) AS total_amount_usd
 ```
 
 Where no rate resolved, every term is NULL and `sum()` returns NULL — the
-intended "not calculable", never zero.
+intended "not calculable", never zero. `fx_rate_used` and `fx_rate_source` are
+taken with `max()`, safe because both are constant within a group: the rate is
+keyed by currency and date, and both are grain columns.
 
-`fx_rate_used` and `fx_rate_source` are taken with `max()`, which is safe because
-both are constant within a group: the rate is keyed by currency and date, and
-both are grain columns.
+#### `run.py`
 
-### `grain_pipeline/quality.py`
-
-Five assertions that **raise** and abort the load, and one reconciliation that
-**warns**. All are run by `run_all_checks()`.
-
-| Check | Catches |
-|---|---|
-| `assert_rate_feed_unique` | duplicate rate keys surviving cleaning — a fan-out source |
-| `assert_dimension_intervals_valid` | overlapping or gapped intervals, zero-length intervals, multiple current rows |
-| `assert_fact_grain_unique` | the declared grain being violated — usually a dimension fan-out |
-| `assert_no_trades_lost` | trade counts not reconciling — loss *and* duplication in one check |
-| `assert_conversions_consistent` | a `not_found` row with a USD amount, or a resolved row without one, or a non-positive rate |
-| `reconcile_segment_chain` | **warns only** — reference table disagreeing with the change log |
-
-Every failure above is **silent by construction**. A fan-out does not raise an
-error; it produces a well-formed table with inflated numbers that looks entirely
-normal until somebody reconciles it against something else. A dropped row is
-worse, because the total simply comes out lower and nothing indicates it should
-not have. These are asserted rather than assumed precisely because inspection
-would not catch them.
-
-`reconcile_segment_chain` warns rather than raises because it cannot corrupt the
-output — the dimension never reads `raw_clients.segment` for a reclassified
-client, so a mismatch is a statement about the *reference table*. Failing the
-load would block a correct result over an upstream inconsistency the pipeline has
-already routed around. The count is surfaced so it can be raised with the source
-system owner. See `DECISIONS.md` §3.2.
-
-### `grain_pipeline/run.py`
-
-`build_analytics(con, source_schema)` runs every transformation against an open
-connection, in dependency order. It is deliberately separate from connection
-management, which is what lets the tests drive the whole pipeline against an
-in-memory database.
-
-`run_pipeline(source_db, target_db)` handles the rest: it checks the source
-exists and raises a message naming the expected path if not, creates `target/` if
-absent, connects to the **target** database, attaches the **source** as `src` in
-`READ_ONLY` mode, builds inside a transaction, and detaches in a `finally` block.
-
-**The transaction is what makes the quality checks protective rather than
-informative.** `CREATE OR REPLACE TABLE` auto-commits, and the checks run last —
-so without it, a failing assertion would abort the process only *after* the
-target had been overwritten with the data it just rejected, destroying the last
-good load. DDL in DuckDB is transactional, so a `DataQualityError` rolls the
-whole build back and the previous target survives intact. See `DECISIONS.md`
-§11.1.
+`build_analytics(con, source_schema)` is three calls — one per model, in
+dependency order. `run_pipeline(source_db, target_db)` handles the rest: it
+checks the source exists, creates `target/` if absent, connects to the **target**
+database, attaches the **source** as `src` in `READ_ONLY` mode, builds inside a
+transaction, and detaches in a `finally` block.
 
 Connecting to the target and attaching the source (rather than the reverse) is
 what makes `CREATE OR REPLACE TABLE dim_clients` write to the target by default,
 and `READ_ONLY` guarantees the raw database cannot be modified.
+
+**The transaction is what makes the quality checks protective rather than
+informative.** `CREATE OR REPLACE TABLE` auto-commits, so without it a failing
+assertion would abort the process only *after* the target had been overwritten
+with the data it just rejected, destroying the last good load. DDL in DuckDB is
+transactional, so a `DataQualityError` rolls the whole build back and the
+previous target survives intact. See `DECISIONS.md` §11.1.
+
+---
+
+### The shared machinery — `grain_pipeline/utils/`
+
+#### `config.py`
+
+Every business literal, so that no value is buried in a query and a reviewer can
+see all of them at once: paths, `SOURCE_SCHEMA`, `TRADE_DATE_CUTOFF`,
+`ACTIVE_STATUS`, `USD`, the SCD2 sentinel bounds, `ISO_4217_PATTERN`,
+`CURRENCY_ALIASES`, and the three `fx_rate_source` enum values.
+
+Keeping these here is also what makes the idempotency claim checkable: no
+`current_date` or `now()` appears anywhere, so there is one place to verify that.
+
+#### `logging_setup.py`
+
+Configures a named logger writing to both stdout and `logs/pipeline.log`. The
+exclusion counts are a **stated deliverable**, not debug output, so they go
+through the logging framework rather than `print()`. `configure_logging()` is
+idempotent, and degrades to stdout alone if the log file cannot be opened — losing
+a log file is recoverable, losing the load is not.
+
+#### `sql.py`
+
+`canonical_text()` → `upper(nullif(trim(col), ''))`, folding blank identifiers to
+NULL so they are handled by the same exclusion as a true NULL.
+`canonical_currency()` adds a `CASE` resolving `CURRENCY_ALIASES`, built from the
+config dict so adding an alias needs no change here. Plus `scalar()` and
+`row_count()`.
+
+These live in `utils` because every model that reads an identifier or a currency
+code needs identical treatment. Normalising the trades table but not the rate
+feed would make the FX join miss silently.
+
+#### `filters.py`
+
+`FilterStep(name, predicate, description)` and `apply_filter_chain()`, which runs
+the steps in order, counting and logging what each removed and **returning** the
+counts as a dict. The counts are produced by the same code that does the
+filtering rather than recomputed afterwards, so they cannot drift from it — and
+the return value is what lets a test assert on exclusions rather than parse log
+output:
+
+```python
+exclusions = fact_daily_exposure.apply_filters(con)
+assert exclusions["missing_or_invalid_currency"] == 1
+```
+
+Because the steps are sequential, a row violating several rules is attributed to
+the **first** rule it fails. The counts read as "removed at this step", not
+"total rows violating this rule".
+
+#### `quality.py`
+
+The framework, not the checks: `DataQualityError`, plus `require()` (raise),
+`warn()` (log and continue) and `passed()` (record a clean check). The checks
+themselves live with the model they guard, because a check is part of building a
+table correctly rather than a separate concern bolted on afterwards.
+
+The two severities encode a rule: **raise when the output would be wrong, warn
+when an input is untidy but the output is unaffected.** `reconcile_segment_chain`
+warns because the dimension never reads `raw_clients.segment` for a reclassified
+client, so a mismatch is a statement about the reference table — failing the load
+would block a correct result over an upstream inconsistency the pipeline has
+already routed around.
 
 ---
 
@@ -457,18 +447,27 @@ deduplicate-before-filter ordering made visible in the counts.
 
 | Rule (from the brief) | Enforced in |
 |---|---|
-| Only `ACTIVE` trades | `cleaning.py` — `FILTER_STEPS[0]` |
-| Only `trade_date <= 2026-06-01` | `cleaning.py` — `FILTER_STEPS[1]` |
-| Amounts in the correct unit | `staging.py` — `build_stg_trades`, before dedup |
-| Currency codes normalised to ISO 4217 | `staging.py` — `_canonical_currency` |
-| Exclude missing client or currency | `cleaning.py` — `FILTER_STEPS[2..3]` |
-| Exclude zero or negative amount | `cleaning.py` — `FILTER_STEPS[4]` |
-| Keep the earliest version of a trade | `cleaning.py` — `deduplicate_trades` |
-| Direct rate, else inverse, else `not_found` | `rates.py` + `facts.py` |
-| Exclude zero/NULL/undated FX rates | `staging.py` — `build_stg_fx_rates` |
-| Segment as at the trade date | `dimensions.py` + the join in `facts.py` |
+| Only `ACTIVE` trades | `fact_daily_exposure.FILTER_STEPS[0]` |
+| Only `trade_date <= 2026-06-01` | `fact_daily_exposure.FILTER_STEPS[1]` |
+| Amounts in the correct unit | `fact_daily_exposure.stage_trades` |
+| Currency codes normalised to ISO 4217 | `utils/sql.canonical_currency` |
+| Exclude missing client or currency | `fact_daily_exposure.FILTER_STEPS[2..3]` |
+| Exclude zero or negative amount | `fact_daily_exposure.FILTER_STEPS[4]` |
+| Keep the earliest version of a trade | `fact_daily_exposure.deduplicate_trades` |
+| Direct rate, else inverse, else `not_found` | `fx_to_usd.build_lookup` + `fact_daily_exposure.build_trades_enriched` |
+| Exclude zero/NULL/undated FX rates | `fx_to_usd.stage_fx_rates` |
+| Segment as at the trade date | `dim_clients.build_dimension` + the join in `fact_daily_exposure` |
 | Idempotent | `run.py` — see below |
-| Log exclusions at each step | `cleaning.py` — `apply_filters` |
+| Log exclusions at each step | `utils/filters.apply_filter_chain` |
+
+Every model also owns its own quality checks, so the guard for a rule sits in the
+same file as the rule:
+
+| Model | Raises on | Warns on |
+|---|---|---|
+| `dim_clients` | overlapping/gapped intervals, zero-length intervals, multiple current rows | reference table disagreeing with the change log |
+| `fx_to_usd` | duplicate `(base, quote, date)` after cleaning | — |
+| `fact_daily_exposure` | grain violation, trade count mismatch, inconsistent conversion | — |
 
 ---
 
@@ -477,6 +476,10 @@ deduplicate-before-filter ordering made visible in the counts.
 32 tests in `tests/test_pipeline.py`, organised into eight sections.
 
 ### How they work
+
+Tests drive the per-model API directly — `dim_clients.stage_clients(con)`,
+`fact_daily_exposure.apply_filters(con)` — so each test names the model that owns
+the rule it is checking.
 
 `conftest.py` provides a `con` fixture: an in-memory DuckDB with an empty `src`
 schema mirroring the source tables. DuckDB resolves `src.raw_trades` identically

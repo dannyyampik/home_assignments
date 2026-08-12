@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from grain_pipeline.logging_setup import configure_logging  # noqa: E402
-from grain_pipeline.run import run_pipeline  # noqa: E402
+from grain_pipeline.pipeline.run import run_pipeline  # noqa: E402
+from grain_pipeline.utils.logging_setup import configure_logging  # noqa: E402
 
 
 def main() -> int:

@@ -21,10 +21,11 @@ If asked "walk me through what you built":
 > It reads the raw DuckDB database and writes two tables: a Type 2 slowly
 > changing dimension for clients, and a daily FX exposure fact at
 > `(date, client, base_currency, quote_currency)`. Transformations are DuckDB
-> SQL, decomposed into staging, a counted filter chain, and separate dimension,
-> rate and fact builds — that split is driven by two of the requirements, since
-> neither per-step exclusion counts nor meaningful unit tests are achievable
-> inside one monolithic query.
+> SQL, organised as one module per model — the dimension, an intermediate rate
+> lookup, and the fact — each owning its own staging, build and quality checks,
+> over a shared utilities package. That split is driven by two of the
+> requirements, since neither per-step exclusion counts nor meaningful unit tests
+> are achievable inside one monolithic query.
 >
 > 692 raw trades reduce to 527 after deduplication and five counted exclusion
 > steps, producing 513 fact rows. Six data quality checks run at the end; five
@@ -61,55 +62,91 @@ Then stop. Let them pick the thread.
 
 ## Part 1 — Design and architecture
 
-**Q: Why split into seven modules for a 692-row dataset? Isn't this over-engineered?**
+**Q: Walk me through how the code is organised.**
 
-Two of the requirements are really design constraints. "At least 3 meaningful
-unit tests covering actual business logic" and "log how many records are excluded
-at each filtering step" are both unsatisfiable inside one query — there would be
-nothing to test in isolation and no intermediate count to observe. The
-decomposition follows from those, not from taste.
+One module per model, plus a package of shared machinery:
 
-The import graph is strictly two-layer with no cycles: `config` and
-`logging_setup` are leaves, every transformation depends only on those two, and
-`run.py` is the only module that knows about the others. That is what lets a test
-import one transformation and drive it against a fixture.
+```
+grain_pipeline/pipeline/   dim_clients.py  fx_to_usd.py  fact_daily_exposure.py  run.py
+grain_pipeline/utils/      config.py  logging_setup.py  sql.py  filters.py  quality.py
+```
 
-**Q: Why `logging_setup.py`? That's 52 lines to configure a logger.**
+Each model owns everything needed to produce its table — its own sources, its
+own staging, its own build, its own quality checks — behind a single
+`build(con, source_schema)`. `run.py` is three calls in dependency order.
 
-Because every transformation calls `get_logger()`. If logging lived in `run.py` —
-which imports every transformation — `staging.py` importing from `run.py` would
-be a circular import that fails at load time. It is a separate module because the
-dependency graph requires a leaf there, not because small files are pretty.
+**Q: Why is a model the unit rather than a processing stage?**
 
-**Q: Why organise by pipeline stage rather than one file per output table?**
+Because a model is the thing that has one reason to change. Segmentation rules
+change: one file. A new currency alias: `config.py` and nothing else. A second
+fact: a new file and one line in `run.py`. Organising by stage — a staging
+module, a cleaning module, a dimension module — spreads each of those changes
+across several files and leaves no file with a single owner.
 
-Three reasons, and the first is arithmetic. At two output entities and ten build
-steps, an entity split gives `dim_clients.py` at ~266 lines and
-`fact_daily_exposure.py` at **~550** — the fact would absorb about 85% of the
-code and the largest file would more than double. Entity orientation concentrates
-here rather than decomposes.
+**Q: Isn't this over-engineered for a 692-row dataset?**
 
-Second, the entities are not separable. `stg_clients` is read by `dimensions.py`
-to build the SCD2 *and* by `cleaning.py` for the `missing_client` filter. Under
-an entity split you either duplicate it or extract a shared module — which is
-what `staging.py` already is.
+The decomposition is not decoration; two of the requirements demand it. "At least
+3 meaningful unit tests covering actual business logic" and "log how many records
+are excluded at each filtering step" are both impossible inside one monolithic
+query — nothing to test in isolation, no intermediate count to observe.
 
-Third, the rules in this assignment live in the *stages*: normalise before
-filter, deduplicate before filter, filter the rate feed before deduplicating it.
-Stage boundaries make those orderings structural rather than conventional.
+What I would concede is that at three models this is close to the minimum
+structure that separates business logic from machinery. The point of the layout
+is that it is the shape that *grows*: at twenty models it takes `dimensions/`,
+`facts/` and `intermediate/` subdirectories under `pipeline/` without any model
+changing.
 
-**Concede:** the design is already a hybrid. `staging.py` and `cleaning.py` are
-layers; `dimensions.py`, `rates.py` and `facts.py` are effectively entity
-modules. And `staging.py` at 231 lines covering four unrelated tables is the
-least cohesive module in the project — a reviewer could fairly argue
-`build_stg_fx_rates` belongs in `rates.py`. Say so before they do.
+**Q: How do the models depend on each other?**
 
-**Q: When would you flip to entity-orientation?**
+Through **data**, not imports. `fact_daily_exposure` reads the `stg_clients` and
+`dim_clients` tables the dimension produced, and `fx_to_usd` from the lookup. No
+model imports another; each declares its reads and writes in its docstring and
+`run.py` resolves the order.
 
-When entities outnumber stages — around fifteen or twenty marts each built by a
-similar short pattern. The mature version uses both axes: layered directories
-with entity files inside, which is what dbt does. At ten build steps, one axis is
-enough, and stage is the one that reduces file size.
+That matters for two reasons. It keeps the import graph acyclic and
+one-directional — `pipeline/` imports from `utils/`, never the reverse — and it
+means any model can be rebuilt in isolation against tables that already exist,
+which is the same contract a warehouse gives you between models.
+
+**Q: Why does `fx_to_usd` get its own module? It's not a dim or a fact.**
+
+It is an intermediate model — a conformed lookup, not published to the target,
+that any model needing a USD conversion joins to. It earns a module for the same
+reasons a dimension does: its own source, its own cleaning rules, its own quality
+check, one reason to change. Folding it into the fact would make that fact the
+only model owning two unrelated sources and would bury a reusable lookup inside a
+single consumer.
+
+**Q: Why do the quality checks live inside the models rather than in one place?**
+
+A check is part of building a table correctly, not a separate concern bolted on
+afterwards. Keeping them together means the guard and the thing it guards are
+read as one unit and change together.
+
+It also fixed a real ordering defect. The rate-feed uniqueness assertion used to
+run *after* `fx_to_usd` was built — by which point a duplicate key had already
+been resolved by the `QUALIFY` tiebreak, so the check was reporting on a decision
+silently already taken. It now runs between staging and the lookup build, so it
+fires before anything acts on the ambiguity. `utils/quality.py` keeps only the
+framework: `DataQualityError` and the `require` / `warn` / `passed` helpers.
+
+**Q: What is in `utils` and how do you decide what goes there?**
+
+Anything every model reuses and nothing specific to any of them: configuration,
+logging, SQL fragments, the counted-filter chain, the check framework. The test
+is whether it mentions a business concept. `canonical_currency()` is in `utils`
+because normalisation is a rule about text; the `NIS → ILS` mapping it applies is
+in `config.py` because that is a fact about currencies.
+
+Keeping it separate is what makes the models comparable — two models that
+normalise an identifier call the same fragment rather than each spelling out
+`upper(nullif(trim(...), ''))`, so a change to the rule happens once.
+
+**Q: Why `logging_setup.py` as its own module?**
+
+Every model calls `get_logger()`. Putting it in `run.py` — which imports every
+model — would be a circular import that fails at load time. It is a leaf because
+the dependency graph requires one there.
 
 **Q: Why f-string SQL rather than parameter binding?**
 
@@ -117,7 +154,15 @@ Parameter binding does not work for identifiers or structural SQL, which is what
 is being interpolated — a schema name, a `CASE` built from the alias map, a date
 literal, a regex. Every interpolated value comes from a module-level constant in
 `config.py`; none comes from source data or user input. It is not an injection
-surface. But expect the question, and do not be surprised by it.
+surface. But expect the question.
+
+**Q: You restructured this. How do you know you didn't break anything?**
+
+Both output tables hash identically before and after, under an explicit
+`ORDER BY` — `dim_clients` at 18 rows and `fact_daily_exposure` at 513, same
+SHA-256 — and every logged exclusion count is unchanged. Then the whole mutation
+battery was re-run against the new layout: 17 deliberate breakages, all caught.
+A refactor that cannot be shown to be behaviour-preserving is a rewrite.
 
 ---
 
@@ -152,7 +197,7 @@ not mean what a consumer would assume.
 **Q: Why is there no surrogate key on `dim_clients`?**
 
 This is a real gap and worth conceding cleanly. There is no surrogate key, and
-the fact stores no foreign key to a specific dimension *version* — `facts.py`
+the fact stores no foreign key to a specific dimension *version* — `fact_daily_exposure.py`
 re-derives `segment` through the range join at build time and discards the join
 key. Consequences:
 
@@ -571,7 +616,7 @@ percentage.
 
 **4. Same-day double segment changes would silently drop a segment.**
 
-`row_number()` and `lead()` in `dimensions.py` order by `effective_date` with no
+`row_number()` and `lead()` in `dim_clients.py` order by `effective_date` with no
 tiebreaker. Two changes for one client on the same date (`A→B` and `B→C` on
 2026-02-01) resolve arbitrarily, one interval becomes zero-length and is dropped
 by the `effective_start_date < effective_end_date` guard, and segment `B`

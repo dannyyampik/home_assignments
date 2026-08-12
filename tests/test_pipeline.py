@@ -13,27 +13,24 @@ import duckdb
 import pytest
 
 from conftest import fx_rate, insert, trade
-from grain_pipeline.cleaning import apply_filters, deduplicate_trades
-from grain_pipeline.dimensions import build_dim_clients
-from grain_pipeline.facts import build_fact_daily_exposure, build_trades_enriched
-from grain_pipeline.quality import (
-    DataQualityError,
-    assert_conversions_consistent,
-    assert_dimension_intervals_valid,
-    assert_fact_grain_unique,
-    assert_no_trades_lost,
-    assert_rate_feed_unique,
-    reconcile_segment_chain,
-    run_all_checks,
-)
-from grain_pipeline.rates import build_fx_to_usd
-from grain_pipeline.run import build_analytics, run_pipeline
-from grain_pipeline.staging import (
-    build_stg_clients,
-    build_stg_fx_rates,
-    build_stg_segment_changes,
-    build_stg_trades,
-)
+from grain_pipeline.pipeline import dim_clients, fact_daily_exposure, fx_to_usd
+from grain_pipeline.pipeline.run import build_analytics, run_pipeline
+from grain_pipeline.utils.quality import DataQualityError
+
+
+def run_all_checks(con):
+    """Every model's checks, for tests that assemble a build by hand.
+
+    In a normal run each model validates itself inside its own ``build()``, so
+    this exists only for tests that call the stages individually and still want
+    the full tripwire.
+    """
+    dim_clients.assert_intervals_valid(con)
+    dim_clients.reconcile_segment_chain(con)
+    fx_to_usd.assert_feed_unique(con)
+    fact_daily_exposure.assert_grain_unique(con)
+    fact_daily_exposure.assert_no_trades_lost(con)
+    fact_daily_exposure.assert_conversions_consistent(con)
 
 
 # --------------------------------------------------------------------------
@@ -57,7 +54,7 @@ def test_amount_in_thousands_is_scaled_and_survives_deduplication(con):
             trade("T2", amount=250.0, amount_in_thousands=False),
         ],
     )
-    build_stg_trades(con)
+    fact_daily_exposure.stage_trades(con)
 
     amounts = dict(
         con.execute("SELECT trade_id, amount FROM stg_trades ORDER BY trade_id, amount").fetchall()
@@ -67,7 +64,7 @@ def test_amount_in_thousands_is_scaled_and_survives_deduplication(con):
     scaled = con.execute("SELECT DISTINCT amount FROM stg_trades WHERE trade_id = 'T1'").fetchall()
     assert scaled == [(5000.0,)], "both versions of T1 should normalise to the same 5000.0"
 
-    deduplicate_trades(con)
+    fact_daily_exposure.deduplicate_trades(con)
     kept = con.execute("SELECT amount FROM trades_deduplicated WHERE trade_id = 'T1'").fetchall()
     assert kept == [(5000.0,)]
 
@@ -88,8 +85,8 @@ def test_deduplication_keeps_earliest_created_at(con):
             trade("T1", amount=500.0, created_at="2025-11-15 17:45:00"),
         ],
     )
-    build_stg_trades(con)
-    deduplicate_trades(con)
+    fact_daily_exposure.stage_trades(con)
+    fact_daily_exposure.deduplicate_trades(con)
 
     rows = con.execute("SELECT trade_id, amount FROM trades_deduplicated").fetchall()
     assert rows == [("T1", 100.0)]
@@ -118,10 +115,10 @@ def test_deduplication_keeps_the_earliest_version_even_when_statuses_disagree(co
             trade("T2", status="CANCELLED", amount=999.0, created_at="2025-10-01 09:00:00"),
         ],
     )
-    build_stg_clients(con)
-    build_stg_trades(con)
-    deduplicate_trades(con)
-    exclusions = apply_filters(con)
+    dim_clients.stage_clients(con)
+    fact_daily_exposure.stage_trades(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    exclusions = fact_daily_exposure.apply_filters(con)
 
     kept = con.execute("SELECT trade_id, status, amount FROM trades_clean ORDER BY trade_id").fetchall()
     assert kept == [("T2", "ACTIVE", 500.0)]
@@ -151,8 +148,8 @@ def test_deduplication_is_deterministic_across_insertion_orders(con, tmp_path):
         for table, columns in _RAW_TABLES.items():
             connection.execute(f"CREATE TABLE {SOURCE_SCHEMA}.{table} ({columns})")
         insert(connection, "raw_trades", ordering)
-        build_stg_trades(connection)
-        deduplicate_trades(connection)
+        fact_daily_exposure.stage_trades(connection)
+        fact_daily_exposure.deduplicate_trades(connection)
         survivors.append(
             connection.execute("SELECT amount FROM trades_deduplicated").fetchall()
         )
@@ -182,10 +179,10 @@ def test_lowercase_currency_is_normalised_not_excluded(con):
             trade("T3", base_currency=None, quote_currency="USD"),  # genuinely missing
         ],
     )
-    build_stg_clients(con)
-    build_stg_trades(con)
-    deduplicate_trades(con)
-    exclusions = apply_filters(con)
+    dim_clients.stage_clients(con)
+    fact_daily_exposure.stage_trades(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    exclusions = fact_daily_exposure.apply_filters(con)
 
     kept = con.execute(
         "SELECT trade_id, base_currency, quote_currency FROM trades_clean ORDER BY trade_id"
@@ -218,16 +215,16 @@ def test_non_iso_currency_alias_is_resolved_to_its_iso_code(con):
     )
     insert(con, "raw_fx_rates", [fx_rate(1, "ILS", "USD", 0.275)])
 
-    build_stg_clients(con)
-    build_stg_segment_changes(con)
-    build_stg_trades(con)
-    build_stg_fx_rates(con)
-    deduplicate_trades(con)
-    exclusions = apply_filters(con)
-    build_dim_clients(con)
-    build_fx_to_usd(con)
-    build_trades_enriched(con)
-    build_fact_daily_exposure(con)
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+    fact_daily_exposure.stage_trades(con)
+    fx_to_usd.stage_fx_rates(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    exclusions = fact_daily_exposure.apply_filters(con)
+    dim_clients.build_dimension(con)
+    fx_to_usd.build_lookup(con)
+    fact_daily_exposure.build_trades_enriched(con)
+    fact_daily_exposure.build_fact(con)
 
     assert exclusions["missing_or_invalid_currency"] == 0, "NIS is ISO-shaped; it is never excluded"
 
@@ -268,10 +265,10 @@ def test_malformed_and_unresolvable_values_are_excluded(con):
             trade("T4", base_currency="GBPX"),  # present, but not ISO-shaped
         ],
     )
-    build_stg_clients(con)
-    build_stg_trades(con)
-    deduplicate_trades(con)
-    exclusions = apply_filters(con)
+    dim_clients.stage_clients(con)
+    fact_daily_exposure.stage_trades(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    exclusions = fact_daily_exposure.apply_filters(con)
 
     kept = [r[0] for r in con.execute("SELECT trade_id FROM trades_clean").fetchall()]
     assert kept == ["T1"]
@@ -295,10 +292,10 @@ def test_cutoff_date_is_inclusive_of_the_boundary(con):
             trade("T3", trade_date="2026-06-02"),
         ],
     )
-    build_stg_clients(con)
-    build_stg_trades(con)
-    deduplicate_trades(con)
-    exclusions = apply_filters(con)
+    dim_clients.stage_clients(con)
+    fact_daily_exposure.stage_trades(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    exclusions = fact_daily_exposure.apply_filters(con)
 
     kept = [r[0] for r in con.execute("SELECT trade_id FROM trades_clean ORDER BY trade_id").fetchall()]
     assert kept == ["T1", "T2"]
@@ -325,16 +322,16 @@ def test_client_identifier_variants_collapse_without_fanout(con):
     insert(con, "raw_trades", [trade("T1", client_id="c007"), trade("T2", client_id="C003")])
     insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])
 
-    build_stg_clients(con)
-    build_stg_segment_changes(con)
-    build_stg_trades(con)
-    build_stg_fx_rates(con)
-    deduplicate_trades(con)
-    apply_filters(con)
-    build_dim_clients(con)
-    build_fx_to_usd(con)
-    build_trades_enriched(con)
-    build_fact_daily_exposure(con)
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+    fact_daily_exposure.stage_trades(con)
+    fx_to_usd.stage_fx_rates(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    fact_daily_exposure.apply_filters(con)
+    dim_clients.build_dimension(con)
+    fx_to_usd.build_lookup(con)
+    fact_daily_exposure.build_trades_enriched(con)
+    fact_daily_exposure.build_fact(con)
 
     assert con.execute("SELECT count(*) FROM stg_clients").fetchone()[0] == 2
     assert con.execute("SELECT count(*) FROM fact_daily_exposure").fetchone()[0] == 2
@@ -369,16 +366,16 @@ def test_segment_reflects_classification_on_the_trade_date(con, trade_date, expe
     insert(con, "raw_trades", [trade("T1", trade_date=trade_date)])
     insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27, rate_date=trade_date)])
 
-    build_stg_clients(con)
-    build_stg_segment_changes(con)
-    build_stg_trades(con)
-    build_stg_fx_rates(con)
-    deduplicate_trades(con)
-    apply_filters(con)
-    build_dim_clients(con)
-    build_fx_to_usd(con)
-    build_trades_enriched(con)
-    build_fact_daily_exposure(con)
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+    fact_daily_exposure.stage_trades(con)
+    fx_to_usd.stage_fx_rates(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    fact_daily_exposure.apply_filters(con)
+    dim_clients.build_dimension(con)
+    fx_to_usd.build_lookup(con)
+    fact_daily_exposure.build_trades_enriched(con)
+    fact_daily_exposure.build_fact(con)
 
     rows = con.execute("SELECT segment, trade_count FROM fact_daily_exposure").fetchall()
     assert rows == [(expected_segment, 1)], "exactly one row, carrying the point-in-time segment"
@@ -402,9 +399,9 @@ def test_dimension_handles_multiple_changes_per_client(con):
             ("C001", "Enterprise", "Strategic", "2025-06-01"),
         ],
     )
-    build_stg_clients(con)
-    build_stg_segment_changes(con)
-    build_dim_clients(con)
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+    dim_clients.build_dimension(con)
 
     rows = con.execute(
         """
@@ -434,8 +431,8 @@ def test_direct_rate_is_preferred_over_inverse(con):
             fx_rate(2, "USD", "GBP", 0.50),  # invertible, deliberately inconsistent
         ],
     )
-    build_stg_fx_rates(con)
-    build_fx_to_usd(con)
+    fx_to_usd.stage_fx_rates(con)
+    fx_to_usd.build_lookup(con)
 
     rate, source = con.execute(
         "SELECT rate_to_usd, rate_source FROM fx_to_usd WHERE currency = 'GBP'"
@@ -452,8 +449,8 @@ def test_inverse_rate_is_the_reciprocal_of_the_usd_base_row(con):
     thing standing between the branch and being untested.
     """
     insert(con, "raw_fx_rates", [fx_rate(1, "USD", "CAD", 1.25)])
-    build_stg_fx_rates(con)
-    build_fx_to_usd(con)
+    fx_to_usd.stage_fx_rates(con)
+    fx_to_usd.build_lookup(con)
 
     rate, source = con.execute(
         "SELECT rate_to_usd, rate_source FROM fx_to_usd WHERE currency = 'CAD'"
@@ -480,16 +477,16 @@ def test_usd_trades_convert_at_parity_and_missing_rates_are_flagged(con):
     )
     insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])  # no JPY, no USD
 
-    build_stg_clients(con)
-    build_stg_segment_changes(con)
-    build_stg_trades(con)
-    build_stg_fx_rates(con)
-    deduplicate_trades(con)
-    apply_filters(con)
-    build_dim_clients(con)
-    build_fx_to_usd(con)
-    build_trades_enriched(con)
-    build_fact_daily_exposure(con)
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+    fact_daily_exposure.stage_trades(con)
+    fx_to_usd.stage_fx_rates(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    fact_daily_exposure.apply_filters(con)
+    dim_clients.build_dimension(con)
+    fx_to_usd.build_lookup(con)
+    fact_daily_exposure.build_trades_enriched(con)
+    fact_daily_exposure.build_fact(con)
 
     rows = dict(
         con.execute(
@@ -523,10 +520,10 @@ def test_invalid_rates_are_filtered_before_deduplication(con):
             fx_rate(4, "CHF", "USD", 1.10, rate_date=None),
         ],
     )
-    build_stg_fx_rates(con)
-    build_fx_to_usd(con)
+    fx_to_usd.stage_fx_rates(con)
+    fx_to_usd.build_lookup(con)
 
-    assert_rate_feed_unique(con)  # no surviving duplicate key
+    fx_to_usd.assert_feed_unique(con)  # no surviving duplicate key
     currencies = [r[0] for r in con.execute("SELECT currency FROM fx_to_usd").fetchall()]
     assert currencies == ["GBP"]
 
@@ -551,9 +548,9 @@ def test_valid_rate_survives_a_duplicate_key_whose_twin_is_invalid(con):
             fx_rate(4, "EUR", "USD", 1.085145),
         ],
     )
-    build_stg_fx_rates(con)
-    assert_rate_feed_unique(con)
-    build_fx_to_usd(con)
+    fx_to_usd.stage_fx_rates(con)
+    fx_to_usd.assert_feed_unique(con)
+    fx_to_usd.build_lookup(con)
 
     resolved = dict(con.execute("SELECT currency, rate_to_usd FROM fx_to_usd").fetchall())
     assert resolved == {"ILS": 0.275537, "EUR": 1.085145}
@@ -577,16 +574,16 @@ def test_weighted_average_is_amount_weighted_not_arithmetic(con):
     )
     insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])
 
-    build_stg_clients(con)
-    build_stg_segment_changes(con)
-    build_stg_trades(con)
-    build_stg_fx_rates(con)
-    deduplicate_trades(con)
-    apply_filters(con)
-    build_dim_clients(con)
-    build_fx_to_usd(con)
-    build_trades_enriched(con)
-    build_fact_daily_exposure(con)
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+    fact_daily_exposure.stage_trades(con)
+    fx_to_usd.stage_fx_rates(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    fact_daily_exposure.apply_filters(con)
+    dim_clients.build_dimension(con)
+    fx_to_usd.build_lookup(con)
+    fact_daily_exposure.build_trades_enriched(con)
+    fact_daily_exposure.build_fact(con)
 
     trades, base, weighted, usd = con.execute(
         """
@@ -673,10 +670,10 @@ def test_status_and_cutoff_exclusions_are_counted_separately(con):
             trade("T7", amount=0.0),
         ],
     )
-    build_stg_clients(con)
-    build_stg_trades(con)
-    deduplicate_trades(con)
-    exclusions = apply_filters(con)
+    dim_clients.stage_clients(con)
+    fact_daily_exposure.stage_trades(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    exclusions = fact_daily_exposure.apply_filters(con)
 
     assert exclusions["non_active_status"] == 2
     assert exclusions["after_cutoff_date"] == 1
@@ -739,10 +736,10 @@ def test_quality_check_detects_a_duplicate_rate_key(con):
             fx_rate(2, "GBP", "USD", 1.29, source="feed_b"),
         ],
     )
-    build_stg_fx_rates(con)
+    fx_to_usd.stage_fx_rates(con)
 
     with pytest.raises(DataQualityError, match="more than one"):
-        assert_rate_feed_unique(con)
+        fx_to_usd.assert_feed_unique(con)
 
 
 # --------------------------------------------------------------------------
@@ -778,7 +775,7 @@ def test_quality_check_detects_a_fact_grain_violation(con):
     )
 
     with pytest.raises(DataQualityError, match="declared grain is violated"):
-        assert_fact_grain_unique(con)
+        fact_daily_exposure.assert_grain_unique(con)
 
 
 def test_quality_check_detects_overlapping_dimension_intervals(con):
@@ -792,7 +789,7 @@ def test_quality_check_detects_overlapping_dimension_intervals(con):
     )
 
     with pytest.raises(DataQualityError, match="overlap or leave a gap"):
-        assert_dimension_intervals_valid(con)
+        dim_clients.assert_intervals_valid(con)
 
 
 def test_quality_check_detects_trades_lost_in_the_dimension_join(con):
@@ -806,7 +803,7 @@ def test_quality_check_detects_trades_lost_in_the_dimension_join(con):
     con.execute("DELETE FROM fact_daily_exposure WHERE base_currency = 'GBP'")
 
     with pytest.raises(DataQualityError, match="reconciliation failed"):
-        assert_no_trades_lost(con)
+        fact_daily_exposure.assert_no_trades_lost(con)
 
 
 def test_quality_check_detects_an_inconsistent_conversion(con):
@@ -821,7 +818,7 @@ def test_quality_check_detects_an_inconsistent_conversion(con):
     )
 
     with pytest.raises(DataQualityError, match="inconsistent rate source"):
-        assert_conversions_consistent(con)
+        fact_daily_exposure.assert_conversions_consistent(con)
 
 
 def test_a_failed_check_leaves_the_previous_target_intact(con, tmp_path):
@@ -893,15 +890,15 @@ def test_original_state_reference_table_does_not_leak_into_the_dimension(con):
     """
     insert(con, "raw_clients", [("C001", "Acme", "SME")])  # original, now stale
     insert(con, "raw_client_segment_changes", [("C001", "SME", "Enterprise", "2025-06-01")])
-    build_stg_clients(con)
-    build_stg_segment_changes(con)
-    build_dim_clients(con)
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+    dim_clients.build_dimension(con)
 
     rows = con.execute(
         "SELECT segment, is_current FROM dim_clients ORDER BY effective_start_date"
     ).fetchall()
     assert rows == [("SME", False), ("Enterprise", True)]
-    assert reconcile_segment_chain(con) == 0
+    assert dim_clients.reconcile_segment_chain(con) == 0
 
 
 def test_segment_chain_inconsistency_is_reported_not_fatal(con):
@@ -913,11 +910,11 @@ def test_segment_chain_inconsistency_is_reported_not_fatal(con):
     """
     insert(con, "raw_clients", [("C001", "Acme", "Strategic")])  # agrees with neither
     insert(con, "raw_client_segment_changes", [("C001", "SME", "Enterprise", "2025-06-01")])
-    build_stg_clients(con)
-    build_stg_segment_changes(con)
-    build_dim_clients(con)
+    dim_clients.stage_clients(con)
+    dim_clients.stage_segment_changes(con)
+    dim_clients.build_dimension(con)
 
-    assert reconcile_segment_chain(con) == 1  # reported
+    assert dim_clients.reconcile_segment_chain(con) == 1  # reported
     rows = con.execute(
         "SELECT segment FROM dim_clients ORDER BY effective_start_date"
     ).fetchall()

@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 SOURCE_DB = PROJECT_ROOT / "source_data" / "grain_raw.duckdb"
 TARGET_DB = PROJECT_ROOT / "target" / "grain_analytics.duckdb"
