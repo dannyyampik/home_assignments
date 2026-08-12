@@ -821,6 +821,29 @@ def test_quality_check_detects_an_inconsistent_conversion(con):
         fact_daily_exposure.assert_conversions_consistent(con)
 
 
+def test_failure_messages_report_how_many_rows_offended(con):
+    """A quality error must say *how many* rows are wrong, not just that some are.
+
+    "One bad key to chase" and "the feed is broken" call for different responses,
+    and the person reading the alert cannot get that number any other way. This
+    is pinned because the count is supplied by a shared helper — a refactor that
+    drops the placeholder would otherwise degrade every message at once, silently
+    and without failing anything.
+    """
+    _minimal_build(con)
+    con.execute(
+        """
+        INSERT INTO fact_daily_exposure
+        SELECT * FROM fact_daily_exposure WHERE base_currency = 'GBP'
+        """
+    )
+
+    with pytest.raises(DataQualityError) as excinfo:
+        fact_daily_exposure.assert_grain_unique(con)
+
+    assert excinfo.value.args[0].startswith("1 "), "the offending count must lead the message"
+
+
 def test_a_failed_check_leaves_the_previous_target_intact(con, tmp_path):
     """A rejected load must not overwrite the last good target.
 

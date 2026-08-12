@@ -375,7 +375,7 @@ def assert_grain_unique(con: duckdb.DuckDBPyConnection) -> None:
             )
             """,
         ),
-        "(trade_date, client_id, base_currency, quote_currency) combinations appear more "
+        "{count} (trade_date, client_id, base_currency, quote_currency) combinations appear more "
         "than once in fact_daily_exposure. The declared grain is violated — most likely "
         "a fan-out on the dim_clients join.",
     )
@@ -413,7 +413,7 @@ def assert_conversions_consistent(con: duckdb.DuckDBPyConnection) -> None:
                OR (fx_rate_used IS NOT NULL AND fx_rate_used <= 0)
             """,
         ),
-        "Fact rows have an inconsistent rate source, converted amount or a non-positive rate.",
+        "{count} fact rows have an inconsistent rate source, converted amount or a non-positive rate.",
     )
     passed("USD conversions are consistent with their recorded rate source.")
 

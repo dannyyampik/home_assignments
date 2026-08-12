@@ -123,7 +123,7 @@ def assert_feed_unique(con: duckdb.DuckDBPyConnection) -> None:
             )
             """,
         ),
-        "(base_currency, quote_currency, rate_date) keys have more than one valid rate "
+        "{count} (base_currency, quote_currency, rate_date) keys have more than one valid rate "
         "after cleaning. A source precedence rule is now required.",
     )
     passed("FX rate feed is unique on (base_currency, quote_currency, rate_date).")

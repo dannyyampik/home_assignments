@@ -24,7 +24,7 @@ pip install -r requirements.txt
 mkdir -p source_data && cp /path/to/grain_raw.duckdb source_data/
 
 python pipeline.py        # builds target/grain_analytics.duckdb
-python -m pytest -q       # 32 tests
+python -m pytest -q       # 33 tests
 ```
 
 The run prints its progress to stdout and mirrors it to `logs/pipeline.log`.
@@ -138,7 +138,7 @@ grain_pipeline/
 
 tests/
     conftest.py              in-memory `src` schema fixtures and row builders
-    test_pipeline.py         32 tests
+    test_pipeline.py         33 tests
 
 target/grain_analytics.duckdb    the built output
 logs/pipeline.log                the most recent run's log
@@ -473,7 +473,7 @@ same file as the rule:
 
 ## Tests
 
-32 tests in `tests/test_pipeline.py`, organised into eight sections.
+33 tests in `tests/test_pipeline.py`, organised into eight sections.
 
 ### How they work
 
@@ -559,6 +559,8 @@ pass equally well against a check whose body had been deleted.
 - `test_quality_check_detects_overlapping_dimension_intervals`
 - `test_quality_check_detects_trades_lost_in_the_dimension_join`
 - `test_quality_check_detects_an_inconsistent_conversion`
+- `test_failure_messages_report_how_many_rows_offended` — an error must say how
+  many rows are wrong, not just that some are.
 - `test_a_failed_check_leaves_the_previous_target_intact` — builds a good target,
   corrupts the feed, and asserts the failed rerun leaves the good rows in place
   rather than overwriting them.
@@ -579,7 +581,7 @@ Running a subset:
 ```bash
 python -m pytest -q -k dedup          # deduplication tests
 python -m pytest -q -k "rate or fx"   # FX resolution tests
-python -m pytest -v                   # names of all 32
+python -m pytest -v                   # names of all 33
 ```
 
 ---

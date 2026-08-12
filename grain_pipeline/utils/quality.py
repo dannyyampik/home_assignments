@@ -34,13 +34,21 @@ class DataQualityError(RuntimeError):
     """Raised when a data quality assertion fails. Aborts and rolls back the run."""
 
 
-def require(condition_failed: int, message: str) -> None:
+def require(offending: int, message: str) -> None:
     """Raise :class:`DataQualityError` when a check finds offending rows.
 
-    ``condition_failed`` is the count of rows or keys violating the rule; zero
-    means the check passed.
+    ``offending`` is the count of rows or keys violating the rule; zero means the
+    check passed. ``message`` may contain a ``{count}`` placeholder, which is
+    filled with that number — an alert that says *how many* rows are wrong is the
+    difference between "one bad key to chase" and "the feed is broken", and the
+    person reading it at 3am cannot get that number any other way.
     """
-    if condition_failed:
+    if offending:
+        # Substituted only when the placeholder is present, so a message that
+        # interpolates its own numbers (or happens to contain a brace) is passed
+        # through untouched rather than raising from inside the error path.
+        if "{count}" in message:
+            message = message.replace("{count}", f"{offending:,}")
         raise DataQualityError(message)
 
 

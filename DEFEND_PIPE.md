@@ -53,7 +53,7 @@ Then stop. Let them pick the thread.
 | Rate resolution | 376 direct, 65 inverse, **72 not_found** (all SGD) |
 | `dim_clients` | 18 interval rows, 13 clients, 5 reclassified |
 | Rate feed | 1,095 rows, 3 invalid, 1,092 retained; 156 dates over a 156-day span |
-| Tests | 32 |
+| Tests | 33 |
 | Trade currencies | ILS 95, SGD 94, GBP 93, CHF 89, EUR 89, CAD 79, AUD 72, JPY 67, NIS 10, null 4 |
 
 `quote_currency` is `USD` on all 692 rows. `USD` is never a base currency.

@@ -236,12 +236,12 @@ def assert_intervals_valid(con: duckdb.DuckDBPyConnection) -> None:
             WHERE next_start IS NOT NULL AND next_start <> effective_end_date
             """,
         ),
-        "Client interval boundaries in dim_clients overlap or leave a gap. "
+        "{count} client interval boundaries in dim_clients overlap or leave a gap. "
         "Point-in-time lookups would return the wrong segment or none at all.",
     )
     require(
         scalar(con, "SELECT count(*) FROM dim_clients WHERE effective_start_date >= effective_end_date"),
-        "dim_clients rows have a non-positive interval length.",
+        "{count} dim_clients rows have a non-positive interval length.",
     )
     require(
         scalar(
@@ -253,7 +253,7 @@ def assert_intervals_valid(con: duckdb.DuckDBPyConnection) -> None:
             )
             """,
         ),
-        "Clients have more than one current row in dim_clients.",
+        "{count} clients have more than one current row in dim_clients.",
     )
     passed("dim_clients intervals are contiguous, non-overlapping and single-current per client.")
 
