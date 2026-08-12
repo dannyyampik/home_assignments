@@ -42,19 +42,26 @@ def apply_filter_chain(
     source_table: str,
     output_table: str,
     steps: tuple[FilterStep, ...],
+    unit: str = "rows",
 ) -> dict[str, int]:
     """Run ``steps`` in order, materialising ``output_table``.
 
     Returns a mapping of step name to rows removed, so a caller can assert on
     the counts as well as read them in the log. Tests use the return value; the
-    log is for operators.
+    log is for operators — which is why ``unit`` exists: the chain is generic,
+    but "527 trades retained" tells an operator what survived and "527 rows" does
+    not.
+
+    The scratch tables are unqualified, so a caller must not invoke this chain
+    re-entrantly from inside another chain. Usage is strictly sequential today;
+    namespacing them by ``output_table`` is the fix if that ever changes.
     """
     logger = get_logger()
     exclusions: dict[str, int] = {}
 
     con.execute(f"CREATE OR REPLACE TEMP TABLE _filtered AS SELECT * FROM {source_table}")
     remaining = row_count(con, "_filtered")
-    logger.info("Filter chain starting with %s rows.", f"{remaining:,}")
+    logger.info("Filter chain starting with %s %s.", f"{remaining:,}", unit)
 
     for step in steps:
         con.execute(
@@ -80,8 +87,9 @@ def apply_filter_chain(
     con.execute(f"CREATE OR REPLACE TEMP TABLE {output_table} AS SELECT * FROM _filtered")
     con.execute("DROP TABLE _filtered")
     logger.info(
-        "Filter chain complete: %s rows excluded in total, %s retained.",
+        "Filter chain complete: %s %s excluded in total, %s retained.",
         f"{sum(exclusions.values()):,}",
+        unit,
         f"{remaining:,}",
     )
     return exclusions

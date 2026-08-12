@@ -44,8 +44,6 @@ from ..utils.logging_setup import get_logger
 from ..utils.quality import passed, require, warn
 from ..utils.sql import canonical_text, row_count, scalar
 
-TABLE = "dim_clients"
-
 
 # --- staging ---------------------------------------------------------------
 

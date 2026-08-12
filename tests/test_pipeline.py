@@ -2,9 +2,14 @@
 
 Each test targets a rule that was ambiguous in the specification or a defect
 found while profiling the source data, and asserts the behaviour recorded in
-DECISIONS.md. Two of them — the inverse rate branch and ``not_found`` — cover
-code paths the supplied dataset never exercises, which is precisely why they need
-synthetic fixtures rather than trust.
+DECISIONS.md.
+
+Most of what is covered here is exercised by the real data — the ``inverse``
+branch by CAD, ``not_found`` by SGD. A few rules are not, and those are the ones
+that most need a fixture: the USD parity branch (no trade has USD as its base
+currency), a client reclassified twice, a NULL ``agreed_rate``, and duplicate
+trade versions that disagree on status. A rule the supplied data cannot reach is
+a rule nothing would notice breaking.
 """
 
 from __future__ import annotations
@@ -444,9 +449,11 @@ def test_direct_rate_is_preferred_over_inverse(con):
 def test_inverse_rate_is_the_reciprocal_of_the_usd_base_row(con):
     """With no direct rate, X -> USD is derived as 1 / (USD -> X).
 
-    Unreachable on the supplied data — the only USD-base row is USD -> CAD, and
-    CAD never appears as a trade base currency — so this fixture is the only
-    thing standing between the branch and being untested.
+    This branch is exercised in production, not merely implemented: USD -> CAD is
+    the only USD-base row in the feed, CAD *is* a trade base currency (79 raw
+    rows), and no CAD -> USD rate exists — so all 65 CAD fact rows take it. The
+    fixture pins the arithmetic and, crucially, the direction: inverting an
+    existing X -> USD row would give USD -> X, which converts the wrong way.
     """
     insert(con, "raw_fx_rates", [fx_rate(1, "USD", "CAD", 1.25)])
     fx_to_usd.stage_fx_rates(con)

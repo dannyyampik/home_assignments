@@ -43,8 +43,6 @@ from ..utils.logging_setup import get_logger
 from ..utils.quality import passed, require
 from ..utils.sql import canonical_currency, canonical_text, row_count, scalar
 
-TABLE = "fact_daily_exposure"
-
 
 #: The exclusion chain, in the order it is applied. Order is fixed so the logged
 #: counts reproduce; a row violating several rules is attributed to the first.
@@ -229,7 +227,9 @@ def apply_filters(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     Returns a mapping of step name to the number of rows it removed, so the
     caller can assert on the counts as well as log them.
     """
-    return apply_filter_chain(con, "trades_deduplicated", "trades_clean", FILTER_STEPS)
+    return apply_filter_chain(
+        con, "trades_deduplicated", "trades_clean", FILTER_STEPS, unit="trades"
+    )
 
 
 # --- enrichment and aggregation --------------------------------------------

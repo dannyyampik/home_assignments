@@ -55,8 +55,6 @@ from ..utils.logging_setup import get_logger
 from ..utils.quality import passed, require
 from ..utils.sql import canonical_currency, row_count, scalar
 
-TABLE = "fx_to_usd"
-
 
 # --- staging ---------------------------------------------------------------
 
