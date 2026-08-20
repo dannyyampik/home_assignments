@@ -9,8 +9,9 @@ attacking the code — mutating it, constructing edge cases, and re-deriving the
 quantitative claims in `DECISIONS.md` against the real database. Where a
 challenge lands, the honest answer is given rather than a defence.
 
-**Read Part 11 first if you are short on time.** Owning a weakness before it is
-found is worth more than defending one after.
+**Read Part 11 first if you are short on time.** It splits into what was found
+and fixed (volunteer it) and what is still live (concede it). Owning a weakness
+before it is found is worth more than defending one after.
 
 ---
 
@@ -191,7 +192,7 @@ right answer.
 
 **Q: You have both sentinels and an `is_current` flag. Isn't that redundant?**
 
-Partly, yes — and worse than redundant. See Part 11, item 2: `is_current` does
+Partly, yes — and worse than redundant. See Part 11, B3: `is_current` does
 not mean what a consumer would assume.
 
 **Q: Why is there no surrogate key on `dim_clients`?**
@@ -425,7 +426,7 @@ Mutation-tested. These all fail correctly when mutated: the half-open interval
 direct-beats-inverse preference, the NIS alias removal, the USD parity branch,
 and stripping the dedup tiebreak columns.
 
-**And they were validated by mutation** — see Part 11, item 3 for the full list
+**And they were validated by mutation** — see Part 11, A2 for the full list
 and for the gaps that were found and closed that way.
 
 ---
@@ -536,123 +537,176 @@ you precisely what changes at 100× and at 10,000×.
 
 ## Part 11 — Own these before they are found
 
-These are real. Raising them yourself converts each from a gotcha into evidence
-that you audit your own work.
+Two groups, and they play differently in a conversation.
 
-**1. A failed quality check used not to protect the target database — now fixed.**
+**Group A** is where you found a real defect and closed it. Volunteer these
+unprompted — they are the strongest evidence you audit your own work, and each
+one has a reproduction and a fix behind it.
 
-This is the strongest thing to volunteer, because it shows you audited your own
-work and found something real. Tell it as a story with a fix at the end.
+**Group B** is still live. Concede these before the interviewer gets there; a
+weakness you name yourself costs nothing, and the same weakness found for you
+costs the room's confidence.
 
-`CREATE OR REPLACE TABLE` is auto-committed and `run_all_checks()` runs *last*,
-so the original design had the checks detecting corruption **after** the target
-had already been overwritten with the data they were about to reject. Reproduced
-by injecting a bogus `EUR/USD` rate of `0.5`: the uniqueness assertion fired and
-the process exited 1, but the persisted target had 513 rows in which that date's
-EUR exposure was converted at `0.5` rather than the genuine `1.085415` —
-understated by about half, with no error visible to any downstream consumer. A
-nightly run would have replaced the last-known-good database with a subtly wrong
-one.
+---
+
+### Group A — found and fixed
+
+**A1. A failed quality check used not to protect the target database.**
+
+The strongest thing to volunteer. Tell it as a story with a fix at the end.
+
+`CREATE OR REPLACE TABLE` is auto-committed and the checks ran *last*, so the
+original design detected corruption **after** the target had already been
+overwritten with the data it was about to reject. Reproduced by injecting a bogus
+`EUR/USD` rate of `0.5`: the uniqueness assertion fired and the process exited 1,
+but the persisted target had 513 rows in which that date's EUR exposure was
+converted at `0.5` rather than the genuine `1.085415` — understated by about
+half, with no error visible to any downstream consumer. A nightly run would have
+replaced the last-known-good database with a subtly wrong one.
 
 The checks detected and reported, but did not protect. That is a monitoring
 feature, not a control.
 
-**The fix:** the whole build, including the checks, now runs inside one explicit
-transaction (`run.py`). DuckDB has transactional DDL, so a `DataQualityError`
-rolls the build back and the previous load survives intact. Verified: after the
-failed run the target still held `1.085415` and all 513 rows, and the rollback is
-logged explicitly so an operator knows the data is stale rather than wrong. Cost
-measured at zero — runs still complete in 0.15–0.37s.
-`test_a_failed_check_leaves_the_previous_target_intact` pins it.
+**The fix:** the whole build, including its checks, now runs inside one explicit
+transaction. DuckDB has transactional DDL, so a `DataQualityError` rolls the
+build back and the previous load survives intact. Verified: after the failed run
+the target still held `1.085415` and all 513 rows, and the rollback is logged so
+an operator knows the data is stale rather than wrong. Cost measured at nil —
+runs still complete in 0.15–0.37s. `test_a_failed_check_leaves_the_previous_target_intact`
+pins it.
 
-If pushed on what you would do at scale: the same property expressed as a
-blue/green swap or a staged publish rather than one long transaction.
+At scale you would express the same property as a blue/green swap or a staged
+publish rather than one long transaction.
 
-**2. `is_current` does not mean "the segment held today."**
+**A2. The quality checks were themselves largely unverified.**
 
-It is defined as `effective_end_date = 9999-12-31`, which means "the last
-interval in the chain." With a future-dated change those differ:
+The second half of the same story. Originally only the rate-feed check had a test
+that constructed bad input and asserted `DataQualityError`; gutting
+`assert_grain_unique` so it could never raise left all 22 tests green. The rest
+were exercised only on their happy path.
+
+Ten tests were added and the suite was then **mutation-tested** to prove they
+work. All of these now go red: gutting any of the raising assertions, removing
+the weighted-average `FILTER` clauses, dropping the ISO format check, dropping
+the client-resolution subquery, changing the cutoff from `<=` to `<`, removing
+the build transaction, and reversing the dedup order.
+
+If asked how you knew the tests were weak: **say you mutation-tested them.**
+Breaking the code deliberately and checking something goes red is the only way to
+know a suite has teeth, and it beats quoting a coverage percentage.
+
+**A3. Same-day segment changes silently dropped a segment.**
+
+The best example in the project of "structurally valid, semantically wrong".
+
+`lead(effective_date) OVER (PARTITION BY client_id ORDER BY effective_date)` has
+nothing to order by when one client has two changes on the same date — the change
+log carries no sequence column. The tie resolved arbitrarily, one interval
+collapsed to zero length and was dropped by the positive-length guard, and a
+segment vanished from that client's history. Meanwhile the interval-integrity
+check **passed**, because what remained was still contiguous, non-overlapping and
+single-current.
+
+So: an arbitrary result, a lost segment, and every assertion green.
+
+**The fix:** `assert_change_log_orderable` now declares the ordering assumption
+as a contract and fails the load. There is no correct answer to guess at, so
+guessing was the wrong response. The test does something deliberate — it builds
+the corrupted dimension anyway and shows the neighbouring check still passes,
+which is the whole point.
+
+**A4. The dedup tiebreak was described as a total ordering and was not one.**
+
+It covered `created_at`, `amount`, `agreed_rate`, `status`, `base_currency` —
+five columns. Two versions tying on all five and differing in `trade_date` or
+`client_id` still fell back to physical row order, which is precisely the
+run-to-run instability the tiebreak exists to remove. It now covers every column
+that can distinguish two versions; rows tying on all of them are identical, so
+which survives is immaterial.
+
+Worth adding: the first fix **was not actually pinned**. Truncating the ordering
+back to five columns left every test green, because no fixture had rows tying
+past `amount`. A fixture was built for exactly that case, and the truncation now
+fails it.
+
+---
+
+### Group B — still live
+
+**B1. `agreed_rate` has no validation at all.**
+
+Probably the single best question an interviewer can ask, so get there first.
+`amount` gets an exclusion rule; market rates get zero, negative and NULL
+filtering plus a uniqueness assertion; the *agreed* rate gets only a `FILTER` in
+the weighted average. It is never checked for null, zero, negative or
+plausibility.
+
+For a business whose product is FX hedging, a fat-fingered agreed rate is
+arguably the highest-value defect in the dataset. The asymmetry is real: careful
+defensive work went into a USD parity branch that never fires, and none into the
+number most likely to matter.
+
+What you would add: non-null and positive at minimum, and realistically a
+tolerance band against the market rate on the same date — which this feed
+supports, since its calendar coverage is complete.
+
+**B2. Nothing flags the share of unconverted exposure.**
+
+72 of 513 fact rows — **14%** — carry no USD figure, all SGD. It is counted, and
+`assert_conversions_consistent` checks it is internally coherent, but nothing
+would fire if an upstream outage pushed that to 60%. For a daily exposure report
+that is a meaningful blind spot. A threshold check on the unconverted share is
+the obvious addition.
+
+**B3. `is_current` does not mean "the segment held today."**
+
+It is defined as `effective_end_date = 9999-12-31`, which means "the last interval
+in the chain". With a future-dated change those differ:
 
 ```
 C001 | SME        | 1900-01-01 | 2027-01-01 | is_current = False
 C001 | Enterprise | 2027-01-01 | 9999-12-31 | is_current = True
 ```
 
-The client is SME today; the flag says Enterprise. Not reachable on this data
-(the latest change is 2026-03-15) but a one-line construction, and future-dated
-reclassifications are entirely normal in production. The documentation
-describes it as "present-day segmentation without a date predicate," which is
-exactly the assumption that breaks. Fix: define it as
-`effective_start_date <= current_date < effective_end_date`, accepting that this
-introduces a wall-clock dependency — which is precisely why it was avoided, so
-say that too.
+The client is SME today; the flag says Enterprise. Not reachable here (latest
+change is 2026-03-15) but a one-line construction, and future-dated
+reclassifications are normal in production. Fixing it means comparing against
+`current_date`, which introduces a wall-clock dependency — say that too, because
+avoiding wall-clock input is what the idempotency argument rests on.
 
-**3. The quality checks used to be largely unverified — now closed.**
-
-Worth volunteering as the second half of the same story. Originally only
-`assert_rate_feed_unique` had a test that constructed bad input and asserted
-`DataQualityError`; gutting `assert_fact_grain_unique` so it could never raise
-left all 22 tests green. The rest were exercised only on their happy path.
-
-Ten tests were added, and the suite was then **mutation-tested** to prove they
-work. All of these now go red: gutting any one of the five raising assertions,
-removing the weighted-average `FILTER` clauses, dropping the ISO regex from the
-currency filter, dropping the client-resolution subquery, changing the cutoff
-from `<=` to `<`, removing the build transaction, and reversing the dedup order.
-
-The specific gaps that are now covered:
-- A NULL `agreed_rate` leaving both sides of the weighted average, and the
-  all-NULL group returning NULL rather than erroring.
-- An unresolvable non-NULL `client_id`, and a malformed-but-non-null currency
-  (`"US"`, `"GBPX"`) — the halves of each rule a NULL-only fixture never reached.
-- The cutoff at 2026-06-01 itself, not just the day after.
-- The dedup case that actually distinguishes the two orderings — duplicate
-  versions disagreeing on status — which the supplied data never exercises.
-
-**If asked how you knew the tests were weak:** say you mutation-tested them.
-Breaking the code deliberately and checking something goes red is the only way to
-know a test suite has teeth, and it is a better answer than a coverage
-percentage.
-
-**4. Same-day double segment changes would silently drop a segment.**
-
-`row_number()` and `lead()` in `dim_clients.py` order by `effective_date` with no
-tiebreaker. Two changes for one client on the same date (`A→B` and `B→C` on
-2026-02-01) resolve arbitrarily, one interval becomes zero-length and is dropped
-by the `effective_start_date < effective_end_date` guard, and segment `B`
-disappears from history — while
-`assert_dimension_intervals_valid` **passes**, because the result is still
-contiguous, non-overlapping and single-current.
-
-That is the "assertion passes while the data is wrong" case, and it also means
-the output would depend on physical row order, which contradicts the determinism
-claim. Not reachable here (verified: no client has two changes on one date). Fix
-is a tiebreaker in the window ordering plus a check for same-day changes.
-
-**5. `trade_id` is trimmed but never uppercased.**
+**B4. `trade_id` is trimmed but never uppercased.**
 
 `client_id`, `status` and both currency columns get `upper(trim(...))`;
 `trade_id` gets only `trim()`. Inert today — every id is already uppercase. But
 `DECISIONS.md` §2 argues client identifiers must be canonicalised "because the
 defect exists in the source and the pipeline should not depend on which variants
-the trade feed happens to use today," and the source demonstrably has case
+the trade feed happens to use today", and the source demonstrably has case
 defects in `client_id` and currencies. The same argument applies to `trade_id`
 and was not applied. A case variant there would silently defeat deduplication.
 
-**6. `amount_in_thousands` defaults to `FALSE`, which understates exposure.**
+**B5. `amount_in_thousands` defaults to `FALSE`, which understates.**
 
 `DECISIONS.md` §5 frames this as purely defensive — an unflagged row is never
-inflated 1000×. The unexamined flip side: a genuinely large trade with a missing
-flag is silently *understated* 1000×. For a hedging business, understated
-exposure is unhedged risk, which is arguably worse than wasted hedge capacity.
-It is a business-risk trade-off presented as an obvious choice. The better answer
-is that a NULL flag should probably be an exclusion or a quarantine, not a
-default in either direction.
+inflated 1000×. The flip side: a genuinely large trade with a missing flag is
+silently *understated* 1000×, and for a hedging business understated exposure is
+unhedged risk. It is a business-risk trade-off, not an obvious choice. A NULL
+flag probably belongs in a quarantine rather than defaulting either way. Never
+exercised — the column has no NULLs.
 
-**7. Documentation overlap.** `README.md` and `DECISIONS.md` restate several
-sections in near-identical prose (idempotency especially). Deliberate — they
-serve different readers — but if challenged on volume, agree that the two could
-be more sharply separated.
+**B6. Schema choices a reviewer may push on.** Covered in detail in Parts 2 and
+5; know that they are open rather than settled:
+
+- **No surrogate key on `dim_clients`**, and the fact stores no reference to the
+  dimension *version* that produced each row — so a historical fact cannot be
+  traced back to the dimension row that made it.
+- **`client_name` sits in the fact.** Not required by the brief, and reachable
+  through the join already needed for `segment`. If challenged, agree — this is
+  the column to drop.
+
+**B7. Documentation volume.** `README.md` and `DECISIONS.md` overlap in places
+(idempotency especially). Deliberate — they answer *what* and *why* for different
+readers — but if challenged on volume, agree the two could be more sharply
+separated rather than defending the page count.
 
 ---
 
@@ -679,7 +733,7 @@ Good questions here signal seniority more than any answer does.
 
 ## Closing note to self
 
-The strongest move in the whole conversation is Part 11, item 1. Volunteering
+The strongest move in the whole conversation is Part 11, A1. Volunteering
 that a failed check leaves the target overwritten — and having reproduced it,
 measured the damage, and verified the transaction fix — demonstrates exactly the
 ownership the role asks for. Leading with a weakness you found and fixed beats
