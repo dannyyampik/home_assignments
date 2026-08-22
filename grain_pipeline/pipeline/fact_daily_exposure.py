@@ -5,8 +5,8 @@
            ``dim_clients``); ``fx_to_usd`` (from ``fx_to_usd``)
 **Writes** ``stg_trades``, ``trades_deduplicated``, ``trades_clean``,
            ``trades_enriched`` (temp), ``fact_daily_exposure``
-**Checks** grain uniqueness, trade reconciliation, conversion consistency
-           (all raise)
+**Checks** agreed-rate validity, grain uniqueness, trade reconciliation,
+           conversion consistency (raise); missing agreed rates (warn)
 
 The upstream dependencies are why ``run.py`` builds this model last. They are
 ordinary warehouse dependencies — a fact reads its conformed dimension and its
@@ -40,7 +40,7 @@ from ..utils.config import (
 )
 from ..utils.filters import FilterStep, apply_filter_chain
 from ..utils.logging_setup import get_logger
-from ..utils.quality import passed, require
+from ..utils.quality import passed, require, warn
 from ..utils.sql import canonical_currency, canonical_text, row_count, scalar
 
 
@@ -366,6 +366,49 @@ def build_fact(con: duckdb.DuckDBPyConnection) -> None:
 # --- checks ----------------------------------------------------------------
 
 
+def assert_agreed_rates_valid(con: duckdb.DuckDBPyConnection) -> None:
+    """The agreed rate is a real price: it cannot be zero or negative.
+
+    This is the number the business is actually transacting on, so it deserves
+    the same rigour as ``amount`` (which has an exclusion rule) and as the market
+    rate (which is filtered for zero and negative in ``fx_to_usd``). Without it,
+    the agreed rate was the one quantity in the pipeline nothing validated.
+
+    A zero or negative rate would flow into ``weighted_avg_agreed_rate`` and
+    produce a plausible-looking number computed over a meaningless price — the
+    silent failure this pipeline exists to refuse. It raises rather than
+    excluding, because the brief enumerates the exclusion rules and this is not
+    among them: dropping the trade would invent a rule, whereas failing the load
+    surfaces the defect for a human decision.
+
+    A NULL rate warns instead. It is a designed-for case, not an error — the
+    trade is real and its amount is known even where its rate is not, so it stays
+    in ``trade_count`` and ``total_amount_base`` and leaves only the weighted
+    average (DECISIONS.md, section 9). The operator should still know it happened.
+
+    **No plausibility band against the market rate.** It is the obvious next
+    check and it is deliberately absent: in this dataset ``agreed_rate`` is
+    uncorrelated with the mid-rate on the same date — ratios run from 0.01 to 299
+    across currencies — so any band tight enough to be useful would reject more
+    than half the trades. A tolerance rule needs a source that actually prices
+    against the market; asserting one here would only encode noise.
+    """
+    require(
+        scalar(con, "SELECT count(*) FROM trades_clean WHERE agreed_rate IS NOT NULL AND agreed_rate <= 0"),
+        "{count} cleaned trades have a zero or negative agreed_rate. A traded price cannot "
+        "be either, and both would corrupt the amount-weighted average silently.",
+    )
+
+    missing = scalar(con, "SELECT count(*) FROM trades_clean WHERE agreed_rate IS NULL")
+    warn(
+        missing,
+        f"{missing:,} cleaned trades have no agreed_rate. They remain in trade_count and "
+        "total_amount_base but are excluded from the weighted average.",
+    )
+    if not missing:
+        passed("Agreed rates are all present and strictly positive.")
+
+
 def assert_grain_unique(con: duckdb.DuckDBPyConnection) -> None:
     """Exactly one fact row per (date, client, base_currency, quote_currency).
 
@@ -434,6 +477,7 @@ def build(con: duckdb.DuckDBPyConnection, source_schema: str = SOURCE_SCHEMA) ->
     stage_trades(con, source_schema)
     deduplicate_trades(con)
     exclusions = apply_filters(con)
+    assert_agreed_rates_valid(con)
     build_trades_enriched(con)
     build_fact(con)
     assert_grain_unique(con)

@@ -54,7 +54,7 @@ Then stop. Let them pick the thread.
 | Rate resolution | 376 direct, 65 inverse, **72 not_found** (all SGD) |
 | `dim_clients` | 18 interval rows, 13 clients, 5 reclassified |
 | Rate feed | 1,095 rows, 3 invalid, 1,092 retained; 156 dates over a 156-day span |
-| Tests | 35 |
+| Tests | 37 |
 | Trade currencies | ILS 95, SGD 94, GBP 93, CHF 89, EUR 89, CAD 79, AUD 72, JPY 67, NIS 10, null 4 |
 
 `quote_currency` is `USD` on all 692 rows. `USD` is never a base currency.
@@ -192,7 +192,7 @@ right answer.
 
 **Q: You have both sentinels and an `is_current` flag. Isn't that redundant?**
 
-Partly, yes — and worse than redundant. See Part 11, B3: `is_current` does
+Partly, yes — and worse than redundant. See Part 11, B2: `is_current` does
 not mean what a consumer would assume.
 
 **Q: Why is there no surrogate key on `dim_clients`?**
@@ -390,16 +390,18 @@ mismatch is a statement about the reference table. Failing the load would block 
 correct result over an upstream inconsistency the pipeline already routes around.
 The rule is: raise when the output is wrong, warn when the input is untidy.
 
-**Q: What is the most important check you did not write?**
+**Q: What was the most important check you were missing?**
 
-`agreed_rate` has no validation at all — and for a company whose product is FX
-hedging, a fat-fingered agreed rate is plausibly the highest-value defect to
-catch. `amount` gets an exclusion rule, market rates get zero/negative/null
-filtering plus a uniqueness assertion, but the agreed rate gets only a `FILTER`
-in the weighted average. That asymmetry is the single best question they can ask,
-and the answer is that it should have a plausibility check — at minimum
-non-null and positive, and realistically a tolerance band against the market
-rate on the same date, which the data supports since the feed has full coverage.
+`agreed_rate` — and it is now there. It had no validation of any kind while
+`amount` had an exclusion rule and market rates had zero/negative/NULL filtering
+plus a uniqueness assertion. For a company whose product is FX hedging, a
+fat-fingered agreed rate is plausibly the highest-value defect in the dataset.
+Zero and negative now raise; NULL warns, because that is the designed-for case
+rather than an error.
+
+No plausibility band against the market rate, deliberately: in this data
+`agreed_rate` is uncorrelated with the mid-rate — ratios span 0.01 to 299 — so
+any useful band would reject over half the trades. See Part 11, A5.
 
 **Q: Anything else missing?**
 
@@ -629,28 +631,38 @@ back to five columns left every test green, because no fixture had rows tying
 past `amount`. A fixture was built for exactly that case, and the truncation now
 fails it.
 
+**A5. `agreed_rate` was the one quantity nothing validated.**
+
+Worth volunteering because the *asymmetry* is the interesting part, not the gap
+itself. `amount` had an exclusion rule; market rates had zero, negative and NULL
+filtering plus a uniqueness assertion; the **agreed** rate — the price the
+business actually transacts on, at an FX hedging company — had nothing. Careful
+defensive work had gone into a USD parity branch that never fires, and none into
+the number most likely to matter.
+
+**The fix:** a zero or negative agreed rate now raises; a NULL warns. The split
+matters and shows you thought about it — a NULL is the designed-for case from
+`DECISIONS.md` §9 (the trade is real, its amount is known, it just leaves the
+weighted average), whereas a zero is a meaningless price that would flow straight
+into that average and produce a plausible number over nonsense. It raises rather
+than excluding because the brief enumerates the exclusion rules and this is not
+among them — dropping the trade would invent a rule; failing the load surfaces it
+for a decision.
+
+**The part worth having ready: why there is no plausibility band.** It is the
+obvious next check, and I deliberately did not add it. In this data `agreed_rate`
+is uncorrelated with the market mid-rate on the same date — per-currency ratios
+span 0.01 to 299, and a 0.5×–2× band rejects 258 of 511 comparable trades. Any
+band tight enough to be useful would fail every run. A tolerance rule needs a
+source that genuinely prices against mid; asserting one here would encode noise.
+
+That is the difference between adding a check and adding a *correct* check.
+
 ---
 
 ### Group B — still live
 
-**B1. `agreed_rate` has no validation at all.**
-
-Probably the single best question an interviewer can ask, so get there first.
-`amount` gets an exclusion rule; market rates get zero, negative and NULL
-filtering plus a uniqueness assertion; the *agreed* rate gets only a `FILTER` in
-the weighted average. It is never checked for null, zero, negative or
-plausibility.
-
-For a business whose product is FX hedging, a fat-fingered agreed rate is
-arguably the highest-value defect in the dataset. The asymmetry is real: careful
-defensive work went into a USD parity branch that never fires, and none into the
-number most likely to matter.
-
-What you would add: non-null and positive at minimum, and realistically a
-tolerance band against the market rate on the same date — which this feed
-supports, since its calendar coverage is complete.
-
-**B2. Nothing flags the share of unconverted exposure.**
+**B1. Nothing flags the share of unconverted exposure.**
 
 72 of 513 fact rows — **14%** — carry no USD figure, all SGD. It is counted, and
 `assert_conversions_consistent` checks it is internally coherent, but nothing
@@ -658,7 +670,7 @@ would fire if an upstream outage pushed that to 60%. For a daily exposure report
 that is a meaningful blind spot. A threshold check on the unconverted share is
 the obvious addition.
 
-**B3. `is_current` does not mean "the segment held today."**
+**B2. `is_current` does not mean "the segment held today."**
 
 It is defined as `effective_end_date = 9999-12-31`, which means "the last interval
 in the chain". With a future-dated change those differ:
@@ -674,7 +686,7 @@ reclassifications are normal in production. Fixing it means comparing against
 `current_date`, which introduces a wall-clock dependency — say that too, because
 avoiding wall-clock input is what the idempotency argument rests on.
 
-**B4. `trade_id` is trimmed but never uppercased.**
+**B3. `trade_id` is trimmed but never uppercased.**
 
 `client_id`, `status` and both currency columns get `upper(trim(...))`;
 `trade_id` gets only `trim()`. Inert today — every id is already uppercase. But
@@ -684,7 +696,7 @@ the trade feed happens to use today", and the source demonstrably has case
 defects in `client_id` and currencies. The same argument applies to `trade_id`
 and was not applied. A case variant there would silently defeat deduplication.
 
-**B5. `amount_in_thousands` defaults to `FALSE`, which understates.**
+**B4. `amount_in_thousands` defaults to `FALSE`, which understates.**
 
 `DECISIONS.md` §5 frames this as purely defensive — an unflagged row is never
 inflated 1000×. The flip side: a genuinely large trade with a missing flag is
@@ -693,7 +705,7 @@ unhedged risk. It is a business-risk trade-off, not an obvious choice. A NULL
 flag probably belongs in a quarantine rather than defaulting either way. Never
 exercised — the column has no NULLs.
 
-**B6. Schema choices a reviewer may push on.** Covered in detail in Parts 2 and
+**B5. Schema choices a reviewer may push on.** Covered in detail in Parts 2 and
 5; know that they are open rather than settled:
 
 - **No surrogate key on `dim_clients`**, and the fact stores no reference to the
@@ -703,7 +715,7 @@ exercised — the column has no NULLs.
   through the join already needed for `segment`. If challenged, agree — this is
   the column to drop.
 
-**B7. Documentation volume.** `README.md` and `DECISIONS.md` overlap in places
+**B6. Documentation volume.** `README.md` and `DECISIONS.md` overlap in places
 (idempotency especially). Deliberate — they answer *what* and *why* for different
 readers — but if challenged on volume, agree the two could be more sharply
 separated rather than defending the page count.

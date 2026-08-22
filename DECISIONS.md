@@ -406,6 +406,22 @@ data cannot.
 Amounts are already filtered to strictly positive, so the denominator cannot be
 zero for a group that exists.
 
+**Validation.** A zero or negative `agreed_rate` **raises**. This is the price the
+business transacts on, so it warrants the rigour `amount` gets from an exclusion
+rule and market rates get from zero/negative filtering; without it, the agreed
+rate was the one quantity in the pipeline nothing validated. It raises rather
+than excluding because the brief enumerates the exclusion rules and this is not
+among them — dropping the trade would invent a rule, whereas failing the load
+surfaces the defect for a decision. A NULL rate **warns** instead: it is the
+designed-for case above, not an error.
+
+**No plausibility band against the market rate.** It is the obvious next check
+and is deliberately absent. In this dataset `agreed_rate` is uncorrelated with
+the mid-rate on the same date — per-currency ratios span 0.01 to 299, and a
+0.5×–2× band would reject 258 of 511 comparable trades. A tolerance rule needs a
+source that genuinely prices against the market; asserting one here would encode
+noise and fail every run.
+
 ---
 
 ## 10. Idempotency
@@ -442,9 +458,11 @@ never observed to fail is not known to work.
 | Change log orderable | `dim_clients` | same-date changes that cannot be sequenced (§3.3) |
 | Interval integrity | `dim_clients` | overlaps, gaps, zero-length intervals, multiple current rows |
 | Rate feed uniqueness | `fx_to_usd` | duplicate keys surviving cleaning (§8.1) |
+| Agreed rate validity | `fact_daily_exposure` | a zero or negative traded price (§9) |
 | Grain uniqueness | `fact_daily_exposure` | the declared grain violated — usually a dimension fan-out |
 | Trade reconciliation | `fact_daily_exposure` | rows lost *or* duplicated, in one check |
 | Segment chain (warns) | `dim_clients` | reference table disagreeing with the change log (§3.2) |
+| Missing agreed rate (warns) | `fact_daily_exposure` | trades with no rate, excluded from the average (§9) |
 
 Plus conversion consistency: a `not_found` row with a USD amount, a resolved row
 without one, or a non-positive rate.
@@ -538,11 +556,10 @@ in-memory `src` schema and run the *production* SQL unmodified.
 - **`client_name` is carried in the fact.** Not required by the brief, and a
   client-level attribute reachable through the join already needed for `segment`.
   Denormalisation for query convenience, at the cost of a rename touching history.
-- **`agreed_rate` has no validation rule.** `amount` gets an exclusion and market
-  rates get zero/negative/NULL filtering plus a uniqueness assertion, but the
-  agreed rate has neither. For an FX business it is arguably the highest-value
-  number to check — at minimum non-null and positive, realistically a tolerance
-  band against the market rate, which this feed's full coverage would support.
+- **`agreed_rate` is checked for sign, not for plausibility.** Zero and negative
+  raise and NULL warns (§9), but nothing tests whether a rate is *reasonable*.
+  The supplied data cannot support such a rule — its agreed rates are
+  uncorrelated with the market — so this needs a source that prices against mid.
 - **Nothing flags the share of unconverted exposure.** 72 of 513 fact rows (14%)
   carry no USD figure. It is counted and internally consistent, but an upstream
   outage pushing that to 60% would fire no check.

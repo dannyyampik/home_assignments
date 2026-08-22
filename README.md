@@ -24,7 +24,7 @@ pip install -r requirements.txt
 mkdir -p source_data && cp /path/to/grain_raw.duckdb source_data/
 
 python pipeline.py        # builds target/grain_analytics.duckdb
-python -m pytest -q       # 35 tests
+python -m pytest -q       # 37 tests
 ```
 
 The run prints its progress to stdout and mirrors it to `logs/pipeline.log`.
@@ -138,7 +138,7 @@ grain_pipeline/
 
 tests/
     conftest.py              in-memory `src` schema fixtures and row builders
-    test_pipeline.py         35 tests
+    test_pipeline.py         37 tests
 
 target/grain_analytics.duckdb    the built output
 logs/pipeline.log                the most recent run's log
@@ -467,13 +467,14 @@ same file as the rule:
 |---|---|---|
 | `dim_clients` | overlapping/gapped intervals, zero-length intervals, multiple current rows | reference table disagreeing with the change log |
 | `fx_to_usd` | duplicate `(base, quote, date)` after cleaning | — |
-| `fact_daily_exposure` | grain violation, trade count mismatch, inconsistent conversion | — |
+| `fact_daily_exposure` | zero/negative agreed rate, grain violation, trade count mismatch, inconsistent conversion | missing agreed rate |
 
 ---
 
 ## Tests
 
-35 tests in `tests/test_pipeline.py`, organised into eight sections.
+37 tests in `tests/test_pipeline.py` (34 functions; one is parametrised over four
+dates), organised into eight sections.
 
 ### How they work
 
@@ -483,106 +484,114 @@ the rule it is checking.
 
 `conftest.py` provides a `con` fixture: an in-memory DuckDB with an empty `src`
 schema mirroring the source tables. DuckDB resolves `src.raw_trades` identically
-whether `src` is an **attached database** or a **plain schema** — so the tests run
-the *production SQL unmodified* against fixture data. They exercise the real
-transformation logic, not a Python reimplementation of it. **This property is
-what makes the tests worth anything, and it should be preserved.**
+whether `src` is an **attached database** or a **plain schema** — so the tests
+build an in-memory `src` schema and run the *production* SQL unmodified. No
+reimplementation, no parallel query string.
 
-Two builders keep the fixtures readable by letting a test override only what it
-cares about:
+Two builders keep fixtures readable by letting a test override only what it cares
+about:
 
 ```python
 trade("T1", base_currency="NIS", amount=1000.0, agreed_rate=0.27)
 fx_rate(1, "ILS", "USD", 0.275)
 ```
 
-### What they cover
+### What each test covers
 
 **1. Amount unit normalisation**
-- `test_amount_in_thousands_is_scaled_and_survives_deduplication` — the flag
-  scales the amount, and scaling happens before dedup, so `5000/false` and
-  `5/true` are recognised as the same value.
 
-**2. Deduplication**
-- `test_deduplication_keeps_earliest_created_at`
-- `test_deduplication_is_deterministic_across_insertion_orders` — the same rows
-  inserted in a different physical order still select the same winner. This is
-  the test that pins the content-based tiebreak.
+| Test | Checks |
+|---|---|
+| `amount_in_thousands_is_scaled_and_survives_deduplication` | `5/true` and `5000/false` both become 5000, and scaling happens before dedup so they aren't seen as different values |
+
+**2. Deterministic deduplication**
+
+| Test | Checks |
+|---|---|
+| `deduplication_keeps_earliest_created_at` | The earliest version wins, not the first row read |
+| `deduplication_keeps_the_earliest_version_even_when_statuses_disagree` | The case that distinguishes dedupe-before-filter from the reverse: an earliest-`CANCELLED` trade is dropped even though a later version is `ACTIVE` |
+| `deduplication_is_deterministic_across_insertion_orders` | Same rows in a different physical order pick the same survivor |
+| `dedup_ordering_covers_every_distinguishing_column` | Versions differing only in a late-ordered column (`trade_date`) still resolve stably — proves the ordering is total |
 
 **3. Normalisation ordering and exclusions**
-- `test_lowercase_currency_is_normalised_not_excluded` — `gbp` and `" Eur "`
-  survive; a genuine NULL is excluded. Normalising *after* the filter would
-  discard the first two, which is the trap in the requirement's ordering.
-- `test_non_iso_currency_alias_is_resolved_to_its_iso_code` — `NIS` resolves to
-  `ILS` and converts directly, while `SGD` (no feed coverage at all) correctly
-  stays `not_found`. The contrast row is the point: resolving a documented alias
-  is a different act from inventing a rate.
-- `test_client_identifier_variants_collapse_without_fanout` — `c007`/`C007` and
-  `C003`/`C003 ` collapse to one client without fanning out the fact.
+
+| Test | Checks |
+|---|---|
+| `lowercase_currency_is_normalised_not_excluded` | `gbp` and `" Eur "` survive; a genuine NULL is excluded. Normalising after the filter would discard the first two |
+| `non_iso_currency_alias_is_resolved_to_its_iso_code` | `NIS` → `ILS` converts directly, while `SGD` (no feed coverage) correctly stays `not_found` |
+| `malformed_and_unresolvable_values_are_excluded` | The half of each rule a NULL-only fixture misses: a non-NULL unknown `client_id`, and non-NULL malformed codes (`"US"`, `"GBPX"`) |
+| `cutoff_date_is_inclusive_of_the_boundary` | A trade *on* 2026-06-01 is kept, the day after excluded — pins `<=` against `<` |
+| `client_identifier_variants_collapse_without_fanout` | `c007`/`C007` and `C003`/`C003 ` collapse to one client without fanning out the fact |
 
 **4. Point-in-time segment lookup**
-- `test_segment_reflects_classification_on_the_trade_date` — parametrised over
-  four dates including the change date itself, pinning the half-open boundary.
-- `test_dimension_handles_multiple_changes_per_client` — two changes produce a
-  correct three-interval chain, a case the supplied data never exercises.
+
+| Test | Checks |
+|---|---|
+| `segment_reflects_classification_on_the_trade_date` | Parametrised over four dates including the change date itself — pins the half-open boundary |
+| `dimension_handles_multiple_changes_per_client` | Two changes produce a correct three-interval chain, which the supplied data never exercises |
 
 **5. FX rate resolution**
-- `test_direct_rate_is_preferred_over_inverse`
-- `test_inverse_rate_is_the_reciprocal_of_the_usd_base_row`
-- `test_usd_trades_convert_at_parity_and_missing_rates_are_flagged` — USD at
-  `1.0`/`direct`; an uncovered currency at NULL/`not_found`, **not zero**.
-- `test_invalid_rates_are_filtered_before_deduplication` — a key whose only rows
-  are NULL and zero disappears entirely.
-- `test_valid_rate_survives_a_duplicate_key_whose_twin_is_invalid` — the shape
-  the real feed actually has. This is the case that makes filter-before-dedupe
-  load-bearing: dedupe-first with an arbitrary pick could retain a `0.0` and
-  convert real trades at a rate of nothing.
+
+| Test | Checks |
+|---|---|
+| `direct_rate_is_preferred_over_inverse` | Direct wins where both exist |
+| `inverse_rate_is_the_reciprocal_of_the_usd_base_row` | `X → USD = 1 / (USD → X)` — pins the arithmetic *and* the direction |
+| `usd_trades_convert_at_parity_and_missing_rates_are_flagged` | USD at `1.0`/`direct`; an uncovered currency at NULL/`not_found`, **not zero** |
+| `invalid_rates_are_filtered_before_deduplication` | A key whose only rows are NULL and zero disappears entirely |
+| `valid_rate_survives_a_duplicate_key_whose_twin_is_invalid` | The shape the real feed has — filter-first keeps the good rate where dedupe-first could keep the `0.0` |
 
 **6. Aggregation**
-- `test_weighted_average_is_amount_weighted_not_arithmetic` — a large trade at
-  one rate and a small one at another must not produce the arithmetic mean.
-- `test_status_and_cutoff_exclusions_are_counted_separately` — each row is
-  attributed to the first rule it fails, so the counts are reproducible.
 
-**7. Idempotency and quality checks**
-- `test_pipeline_is_idempotent` — two full builds produce identical contents.
-- `test_quality_check_detects_a_duplicate_rate_key` — the assertion actually
-  fires. A check that has never been seen to fail is not known to work.
-- `test_original_state_reference_table_does_not_leak_into_the_dimension`
-- `test_segment_chain_inconsistency_is_reported_not_fatal` — an inconsistent
-  chain is counted and warned about, and the load still completes.
+| Test | Checks |
+|---|---|
+| `weighted_average_is_amount_weighted_not_arithmetic` | A large trade at one rate and a small one at another must not give the arithmetic mean |
+| `null_agreed_rate_leaves_the_average_but_stays_in_the_totals` | A NULL rate leaves both sides of the average but still counts in `trade_count` and `total_amount_base` |
+| `all_null_agreed_rates_yield_null_not_a_division_error` | A group with no rates at all returns NULL rather than erroring |
+| `status_and_cutoff_exclusions_are_counted_separately` | Each row is attributed to the first rule it fails, so counts reproduce |
 
-**8. Quality gate failure paths** — each of the five raising assertions gets the
-corruption it exists to catch, and must raise. Testing only the happy path would
-pass equally well against a check whose body had been deleted.
-- `test_quality_check_detects_a_fact_grain_violation`
-- `test_quality_check_detects_overlapping_dimension_intervals`
-- `test_quality_check_detects_trades_lost_in_the_dimension_join`
-- `test_quality_check_detects_an_inconsistent_conversion`
-- `test_failure_messages_report_how_many_rows_offended` — an error must say how
-  many rows are wrong, not just that some are.
-- `test_a_failed_check_leaves_the_previous_target_intact` — builds a good target,
-  corrupts the feed, and asserts the failed rerun leaves the good rows in place
-  rather than overwriting them.
+**7. Idempotency and quality gates**
 
-### Mutation-tested
+| Test | Checks |
+|---|---|
+| `pipeline_is_idempotent` | Two full builds produce identical output |
+| `quality_check_detects_a_duplicate_rate_key` | The rate-feed assertion actually fires on two valid rates for one key |
+| `original_state_reference_table_does_not_leak_into_the_dimension` | `raw_clients.segment` never overrides change-log history for a reclassified client |
+| `segment_chain_inconsistency_is_reported_not_fatal` | An inconsistent chain is counted and warned about, and the load still completes |
 
-The suite was validated by breaking the production code and confirming something
-goes red. All of these are caught: the half-open interval (`<` → `<=`), dedup
-ordering (earliest → latest), rate inversion (`1/r` → `r`), direct-beats-inverse
-preference, removal of the NIS alias, removal of the USD parity branch, stripping
-the dedup tiebreak columns, removing the weighted-average `FILTER` clauses,
-dropping the ISO regex from the currency filter, dropping the client-resolution
-subquery, changing the cutoff from `<=` to `<`, removing the build transaction,
-and gutting any one of the five raising assertions.
+**8. Quality gate failure paths** — each raising assertion gets the corruption it
+exists to catch, and must raise. Testing only the happy path would pass equally
+well against a check whose body had been deleted.
+
+| Test | Checks |
+|---|---|
+| `quality_check_detects_a_non_positive_agreed_rate` | A zero traded price raises before it can reach the weighted average |
+| `missing_agreed_rate_warns_but_does_not_fail` | A NULL rate warns and the load completes, with the trade still counted |
+| `quality_check_detects_a_fact_grain_violation` | A duplicated grain key raises — the dimension fan-out detector |
+| `quality_check_detects_unorderable_segment_changes` | Two changes on one date raise; also shows the interval check *passes* on the corrupted result, which is the point |
+| `quality_check_detects_overlapping_dimension_intervals` | An overlapping interval raises before it can fan out a point-in-time lookup |
+| `quality_check_detects_trades_lost_in_the_dimension_join` | Trade counts not reconciling raises — catches loss and duplication in one check |
+| `quality_check_detects_an_inconsistent_conversion` | A `not_found` row carrying a USD amount raises |
+| `failure_messages_report_how_many_rows_offended` | Error messages lead with the offending count, not just the fact of failure |
+| `a_failed_check_leaves_the_previous_target_intact` | A rejected load rolls back rather than overwriting the last good target |
 
 Running a subset:
 
 ```bash
 python -m pytest -q -k dedup          # deduplication tests
 python -m pytest -q -k "rate or fx"   # FX resolution tests
-python -m pytest -v                   # names of all 35
+python -m pytest -v                   # names of all 37
 ```
+
+### Mutation-tested
+
+The suite was validated by breaking the production code and confirming something
+goes red. All of these are caught: the half-open interval (`<` → `<=`), dedup
+ordering (earliest → latest), truncating the dedup tiebreak, rate inversion
+(`1/r` → `r`), direct-beats-inverse preference, removal of the NIS alias, removal
+of the USD parity branch, removing the weighted-average `FILTER` clauses,
+dropping the ISO format check, dropping the client-resolution subquery, changing
+the cutoff from `<=` to `<`, removing the build transaction, and gutting any one
+of the six raising assertions.
 
 ---
 

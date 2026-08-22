@@ -33,6 +33,7 @@ def run_all_checks(con):
     dim_clients.assert_intervals_valid(con)
     dim_clients.reconcile_segment_chain(con)
     fx_to_usd.assert_feed_unique(con)
+    fact_daily_exposure.assert_agreed_rates_valid(con)
     fact_daily_exposure.assert_grain_unique(con)
     fact_daily_exposure.assert_no_trades_lost(con)
     fact_daily_exposure.assert_conversions_consistent(con)
@@ -801,6 +802,44 @@ def _minimal_build(con):
         [fx_rate(1, "GBP", "USD", 1.27), fx_rate(2, "EUR", "USD", 1.09)],
     )
     build_analytics(con)
+
+
+def test_quality_check_detects_a_non_positive_agreed_rate(con):
+    """A zero or negative traded price raises rather than reaching the average.
+
+    The agreed rate is the number the business transacts on, and it was the one
+    quantity nothing validated. A zero would flow into the weighted average and
+    produce a plausible figure computed over a meaningless price.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(con, "raw_trades", [trade("T1"), trade("T2", agreed_rate=0.0)])
+    insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])
+
+    dim_clients.stage_clients(con)
+    fact_daily_exposure.stage_trades(con)
+    fact_daily_exposure.deduplicate_trades(con)
+    fact_daily_exposure.apply_filters(con)
+
+    with pytest.raises(DataQualityError, match="zero or negative agreed_rate"):
+        fact_daily_exposure.assert_agreed_rates_valid(con)
+
+
+def test_missing_agreed_rate_warns_but_does_not_fail(con):
+    """A NULL rate is a designed-for case, so it warns and the load completes.
+
+    The trade is real and its amount is known even where its rate is not, so it
+    stays in trade_count and total_amount_base and leaves only the weighted
+    average. Raising here would block a correct result over a gap the pipeline
+    already handles.
+    """
+    insert(con, "raw_clients", [("C001", "Acme", "SME")])
+    insert(con, "raw_trades", [trade("T1"), trade("T2", agreed_rate=None)])
+    insert(con, "raw_fx_rates", [fx_rate(1, "GBP", "USD", 1.27)])
+
+    build_analytics(con)  # completes, including every check
+
+    row = con.execute("SELECT trade_count, total_amount_base FROM fact_daily_exposure").fetchone()
+    assert row == (2, 2000.0), "the unrated trade still counts and still sums"
 
 
 def test_quality_check_detects_a_fact_grain_violation(con):
